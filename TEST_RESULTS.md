@@ -49,4 +49,22 @@ context to conversion errors. Regression tests cover exact scientific prices/siz
 exponent limits, overflow, rejection of lossy precision, and exclusion of a spot market
 with an unrepresentable price. `cargo test --locked`: 38 passed. Formatting and the
 release build passed. Both batch and streamed local process tests also passed again.
-Actual-node confirmation remains pending.
+Subsequent user logs showed successful startup and continued Ready operation.
+
+## Latency investigation follow-up — September 25 UTC
+
+Read-only LAN/public probes were authorized for this follow-up. See
+[INVESTIGATION.md](INVESTIGATION.md) for measurements and sampling limitations;
+these do not retroactively change the original local-only test scope above.
+
+* `cargo test --locked`: 40 passed, including bounded metric windows and retained
+  fragment byte accounting/clear-on-recovery with no internal fields in serialized batches.
+* `cargo fmt --check`, `git diff --check`, Python syntax checks: passed.
+* Native `cargo build --locked --release --bin websocket_server`: passed.
+* Batch and streamed actual-process mock tests: passed; now also check version,
+  capabilities, stage measurements, and continued L2 delivery after rejected WS post.
+* Read-only 60-second live BTC probe: 110 comparable five-level books matched,
+  150 comparable trades matched, zero transport errors; no book over one second old.
+* Instrumented build has not been deployed to the node. No host CPU/disk attribution
+  or production instrumentation overhead measurement is claimed.
+* Linux host collector: syntax checked only. Docker Linux image build remains unverified.

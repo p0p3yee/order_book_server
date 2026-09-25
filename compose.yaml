@@ -1,6 +1,9 @@
 services:
   websocket:
-    build: .
+    build:
+      context: .
+      args:
+        SOURCE_REVISION: "${SOURCE_REVISION:-unknown}"
     image: hyperliquid-ws:low-latency
     init: true
     restart: unless-stopped

@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Run ON the Linux node host. Read-only bounded collection; never restarts containers or requests fileSnapshot."""
+import argparse
+import datetime
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import time
+import urllib.error
+import urllib.request
+
+
+def run(args):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
+    except Exception as err: return {'error':str(err)}
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--seconds',type=int,default=300)
+    parser.add_argument('--ws-container',default='hyperliquid-ws-low-latency')
+    parser.add_argument('--node-container')
+    parser.add_argument('--base-url',default='http://127.0.0.1:8000')
+    parser.add_argument('--out',type=Path)
+    a=parser.parse_args()
+    if not 1 <= a.seconds <= 900: parser.error('seconds must be 1..900')
+    start=datetime.datetime.now(datetime.timezone.utc)
+    out=a.out or Path('/tmp')/('hl-ws-diagnostics-'+start.strftime('%Y%m%dT%H%M%SZ'))
+    out.mkdir(parents=True,exist_ok=False)
+    metadata={'start_utc':start.isoformat(),'duration_s':a.seconds,'containers':{}}
+    pids=[]
+    for name in filter(None,[a.ws_container,a.node_container]):
+        result=run(['docker','inspect',name])
+        try:
+            c=json.loads(result['stdout'])[0]
+            host=c['HostConfig']; state=c['State']
+            metadata['containers'][name]={'image_id':c['Image'],'pid':state['Pid'], 'started_at':state['StartedAt'],
+                'restart_count':c['RestartCount'],'network_mode':host.get('NetworkMode'), 'nano_cpus':host.get('NanoCpus'),
+                'cpu_quota':host.get('CpuQuota'),'cpu_period':host.get('CpuPeriod'),'memory_limit':host.get('Memory'),
+                'image_labels':{k:v for k,v in (c.get('Config',{}).get('Labels') or {}).items() if k.startswith('org.opencontainers.image.')}}
+            if state['Pid']:pids.append(state['Pid'])
+        except Exception:
+            metadata['containers'][name]={'error':'docker inspect unavailable', 'stderr':result.get('stderr',result.get('error'))}
+    metadata['clock']=run(['timedatectl','show','-p','NTPSynchronized','-p','TimeUSec'])
+    metadata['chrony']=run(['chronyc','tracking'])
+    metadata['tcp_listeners']=run(['ss','-ltnp','sport = :8000'])
+    (out/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n')
+    jobs=[]; files=[]
+    commands=[('vmstat.txt',['vmstat','1',str(a.seconds+1)]),
+              ('iostat.txt',['iostat','-x','1',str(a.seconds+1)])]
+    if pids:commands.append(('pidstat.txt',['pidstat','-dru','-p',','.join(map(str,pids)),'1',str(a.seconds)]))
+    for filename,command in commands:
+        if shutil.which(command[0]):
+            f=(out/filename).open('w');files.append(f)
+            jobs.append(subprocess.Popen(command,stdout=f,stderr=subprocess.STDOUT))
+        else:(out/filename).write_text(f'{command[0]} unavailable; no package installation attempted\n')
+    def read(path):
+        try:return Path(path).read_text()
+        except OSError as err:return str(err)
+    try:
+        deadline=time.monotonic()+a.seconds
+        with (out/'samples.jsonl').open('w') as f:
+            while time.monotonic()<deadline:
+                tick=time.monotonic()
+                sample={'utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        'pressure':{k:read('/proc/pressure/'+k) for k in ['cpu','io','memory']}, 'processes':{}}
+                for pid in pids:
+                    proc={k:read(f'/proc/{pid}/{k}') for k in ['stat','status','io','cgroup']}
+                    for line in proc['cgroup'].splitlines():
+                        if line.startswith('0::'):
+                            group=Path('/sys/fs/cgroup')/line[3:].lstrip('/')
+                            proc['cgroup_v2']={k:read(group/k) for k in ['cpu.stat','cpu.max','memory.current','memory.events','io.stat','cpu.pressure','io.pressure']}
+                    sample['processes'][str(pid)]=proc
+                for endpoint in ['health','diagnostics']:
+                    began=time.monotonic()
+                    try:
+                        try:response=urllib.request.urlopen(a.base_url.rstrip('/')+'/'+endpoint,timeout=2)
+                        except urllib.error.HTTPError as err:response=err
+                        with response:
+                            body=response.read().decode()
+                            sample[endpoint]={'status':response.status,'body':json.loads(body) if body else None,
+                                              'rtt_ms':(time.monotonic()-began)*1000}
+                    except Exception as err:sample[endpoint]={'error':str(err)}
+                f.write(json.dumps(sample)+'\n');f.flush()
+                time.sleep(max(0,min(deadline-time.monotonic(),1-(time.monotonic()-tick))))
+    finally:
+        for job in jobs:
+            if job.poll() is None:job.terminate()
+            job.wait(timeout=5)
+        for f in files:f.close()
+    logs=run(['docker','logs','--since',start.isoformat(),'--tail','1000',a.ws_container])
+    (out/'ws.log').write_text(logs.get('stdout','')+logs.get('stderr','')+logs.get('error',''))
+    print(f'Collected read-only diagnostics in {out}. Logs may contain wallet addresses; review before sharing.')
+
+if __name__=='__main__':main()

@@ -5,6 +5,7 @@ use crate::{
         multi_book::{Snapshots, load_snapshots_from_str_filtered},
     },
     prelude::*,
+    telemetry::{Metrics, Trace, unix_us},
     types::{
         L4Order,
         inner::{InnerL4Order, InnerLevel},
@@ -59,6 +60,8 @@ pub(crate) struct OrderBookListener {
     last_fill: Option<u64>,
     buffered_bytes: usize,
     last_progress: Instant,
+    latest_trace: Option<Trace>,
+    pub(crate) metrics: Arc<Metrics>,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     pub(crate) l2_subscriptions: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -85,6 +88,8 @@ impl OrderBookListener {
             last_fill: None,
             buffered_bytes: 0,
             last_progress: Instant::now(),
+            latest_trace: None,
+            metrics: Arc::new(Metrics::default()),
             internal_message_tx: tx,
             l2_subscriptions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -115,6 +120,7 @@ impl OrderBookListener {
         self.status.state = if stale { Health::Stale } else { Health::Resyncing };
         self.status.reason = reason;
         self.state = None;
+        self.latest_trace = None;
         self.checkpoint = None;
         self.orders.clear();
         self.diffs.clear();
@@ -178,15 +184,34 @@ impl OrderBookListener {
         self.status_message();
         self.drain()
     }
+    #[cfg(test)]
     fn ingest(&mut self, source: usize, line: &str) -> Result<()> {
+        self.ingest_observed(source, line, Instant::now(), unix_us())
+    }
+    pub(crate) fn diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({"status":self.status,"server":crate::telemetry::version(),
+            "config":{"poll_interval_ms":self.config.poll_interval.as_millis(),
+                "stale_after_ms":self.config.stale_after.as_millis(),
+                "stream_with_block_info":self.config.stream_with_block_info,
+                "integrity_interval_secs":self.config.integrity_interval.as_secs()},
+            "backlog":{"order_blocks":self.orders.len(),"diff_blocks":self.diffs.len(),
+                "retained_input_bytes":self.retained_input_bytes(),
+                "budget_accounting_counter_bytes":self.buffered_bytes,
+                "note":"retained_input_bytes counts original record bytes for retained blocks, not process RSS"},
+            "metrics":self.metrics.snapshot(),
+            "clock_note":"duration metrics use monotonic time; node/output timestamps need synchronized clocks; socket send completion is not client receipt"})
+    }
+    fn retained_input_bytes(&self) -> usize {
+        self.orders.values().map(|b| b.input_bytes).sum::<usize>()
+            + self.diffs.values().map(|b| b.input_bytes).sum::<usize>()
+            + self.fills.as_ref().map_or(0, |b| b.input_bytes)
+    }
+    fn ingest_observed(&mut self, source: usize, line: &str, first_read: Instant, read_us: i64) -> Result<()> {
+        let ingest_start = Instant::now();
         self.buffered_bytes = self.buffered_bytes.saturating_add(line.len());
         if self.buffered_bytes > self.config.max_buffer_bytes {
-            // Amortized accounting: never serialize the replay queues on the hot path.
-            self.buffered_bytes =
-                self.orders.values().map(|b| serde_json::to_vec(b).map_or(0, |v| v.len())).sum::<usize>()
-                    + self.diffs.values().map(|b| serde_json::to_vec(b).map_or(0, |v| v.len())).sum::<usize>()
-                    + self.fills.as_ref().map_or(0, |b| serde_json::to_vec(b).map_or(0, |v| v.len()))
-                    + line.len();
+            // Recount retained input lengths; never serialize queues just to measure them.
+            self.buffered_bytes = self.retained_input_bytes().saturating_add(line.len());
             if self.buffered_bytes > self.config.max_buffer_bytes {
                 return Err("replay buffer limit exceeded".into());
             }
@@ -194,21 +219,49 @@ impl OrderBookListener {
         match source {
             0 => {
                 let mut batch: Batch<NodeDataOrderStatus> = serde_json::from_str(line)?;
+                batch.input_bytes = line.len();
+                batch.trace = Some(Trace::new(
+                    batch.block_number(),
+                    batch.block_time.and_utc().timestamp_micros(),
+                    batch.local_time.and_utc().timestamp_micros(),
+                    first_read,
+                    read_us,
+                ));
+                record_decode(&self.metrics, source, &batch, ingest_start);
                 batch.events.retain(|e| self.config.includes(&e.order.coin));
                 insert_batch(&mut self.orders, &mut self.order_watermark, batch, self.config.stream_with_block_info)?;
             }
             1 => {
                 let mut batch: Batch<NodeDataOrderDiff> = serde_json::from_str(line)?;
+                batch.input_bytes = line.len();
+                batch.trace = Some(Trace::new(
+                    batch.block_number(),
+                    batch.block_time.and_utc().timestamp_micros(),
+                    batch.local_time.and_utc().timestamp_micros(),
+                    first_read,
+                    read_us,
+                ));
+                record_decode(&self.metrics, source, &batch, ingest_start);
                 batch.events.retain(|e| self.config.includes(&e.coin().value()));
                 insert_batch(&mut self.diffs, &mut self.diff_watermark, batch, self.config.stream_with_block_info)?;
             }
             _ => {
                 let mut batch: Batch<NodeDataFill> = serde_json::from_str(line)?;
+                batch.input_bytes = line.len();
+                batch.trace = Some(Trace::new(
+                    batch.block_number(),
+                    batch.block_time.and_utc().timestamp_micros(),
+                    batch.local_time.and_utc().timestamp_micros(),
+                    first_read,
+                    read_us,
+                ));
+                record_decode(&self.metrics, source, &batch, ingest_start);
                 batch.events.retain(|e| self.config.includes(&e.1.coin));
                 if self.config.stream_with_block_info {
                     if let Some(mut previous) = self.fills.take() {
                         if previous.block_number() == batch.block_number() {
                             previous.events.extend(batch.events);
+                            previous.input_bytes = previous.input_bytes.saturating_add(batch.input_bytes);
                             self.fills = Some(previous);
                             return Ok(());
                         }
@@ -228,7 +281,11 @@ impl OrderBookListener {
     fn publish_fills(&mut self, batch: Batch<NodeDataFill>) {
         if self.last_fill.is_none_or(|h| h < batch.block_number()) {
             self.last_fill = Some(batch.block_number());
-            self.send(InternalMessage::Fills { batch });
+            let trace = batch.trace.map(Trace::publish);
+            if let Some(t) = trace {
+                self.metrics.elapsed("fills_read_to_publish_us", t.first_read);
+            }
+            self.send(InternalMessage::Fills { batch, trace });
         }
     }
     fn drain(&mut self) -> Result<()> {
@@ -251,7 +308,25 @@ impl OrderBookListener {
             let orders = self.orders.remove(&next).ok_or("missing orders")?;
             let diffs = self.diffs.remove(&next).ok_or("missing diffs")?;
             let time = orders.block_time();
+            let mut trace = diffs.trace.or(orders.trace);
+            if let (Some(o), Some(d)) = (orders.trace, diffs.trace) {
+                self.metrics.observe(
+                    "book_stream_arrival_skew_us",
+                    o.first_read.max(d.first_read).duration_since(o.first_read.min(d.first_read)).as_secs_f64() * 1e6,
+                );
+                self.metrics.elapsed("book_replay_wait_us", o.parsed.max(d.parsed));
+                if let Some(t) = &mut trace {
+                    t.first_read = o.first_read.min(d.first_read);
+                    t.read_us = o.read_us.min(d.read_us);
+                }
+            }
+            let apply_start = Instant::now();
             state.apply_updates(orders.clone(), diffs.clone())?;
+            self.metrics.elapsed("book_apply_us", apply_start);
+            if let Some(t) = &mut trace {
+                t.applied_us = unix_us();
+            }
+            self.latest_trace = trace;
             self.status.height = Some(next);
             self.status.upstream_time = Some(time);
             self.last_progress = Instant::now();
@@ -272,20 +347,50 @@ impl OrderBookListener {
                     generation: self.status.generation,
                     diff_batch: diffs,
                     status_batch: orders,
+                    trace: trace.map(Trace::publish),
                 });
             }
         }
         if self.is_ready() && self.l2_subscriptions.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            let l2_start = Instant::now();
             if let Some((time, l2_snapshots)) = self.state.as_mut().and_then(|s| s.l2_snapshots(true)) {
+                self.metrics.elapsed("l2_aggregate_us", l2_start);
+                let trace = self.latest_trace.map(Trace::publish);
+                if let Some(t) = trace {
+                    self.metrics.elapsed("book_read_to_publish_us", t.first_read);
+                }
                 self.send(InternalMessage::Snapshot {
                     generation: self.status.generation,
                     height: self.status.height.unwrap_or_default(),
                     l2_snapshots,
                     time,
+                    trace,
                 });
             }
         }
         Ok(())
+    }
+}
+
+fn record_decode<E>(metrics: &Metrics, source: usize, batch: &Batch<E>, start: Instant) {
+    metrics.elapsed(["orders_json_parse_us", "diffs_json_parse_us", "fills_json_parse_us"][source], start);
+    if let Some(trace) = batch.trace {
+        metrics.observe(
+            ["orders_block_to_node_local_us", "diffs_block_to_node_local_us", "fills_block_to_node_local_us"][source],
+            (trace.node_local_us - trace.block_us) as f64,
+        );
+        metrics.observe(
+            ["orders_node_local_to_read_us", "diffs_node_local_to_read_us", "fills_node_local_to_read_us"][source],
+            (trace.read_us - trace.node_local_us) as f64,
+        );
+    }
+}
+impl InternalMessage {
+    pub(crate) fn trace(&self) -> Option<Trace> {
+        match self {
+            Self::Snapshot { trace, .. } | Self::Fills { trace, .. } | Self::L4BookUpdates { trace, .. } => *trace,
+            _ => None,
+        }
     }
 }
 
@@ -308,6 +413,7 @@ fn insert_batch<E>(
             return Err("inconsistent block timestamps".into());
         }
         previous.events.extend(batch.events);
+        previous.input_bytes = previous.input_bytes.saturating_add(batch.input_bytes);
     } else {
         queue.insert(height, batch);
     }
@@ -330,6 +436,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, config: S
             tails[i] = Some(Tail::open(path, true)?);
         }
     }
+    let metrics = listener.lock().await.metrics.clone();
     let mut ticker = tokio::time::interval(config.poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut discovery = Instant::now();
@@ -339,7 +446,11 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, config: S
     let mut snapshot_generation = 0;
     let mut diagnostic = Instant::now();
     loop {
-        ticker.tick().await;
+        let scheduled = ticker.tick().await;
+        metrics.observe(
+            "listener_tick_lateness_us",
+            tokio::time::Instant::now().saturating_duration_since(scheduled).as_secs_f64() * 1e6,
+        );
         for i in 0..3 {
             let result: Result<()> = (|| {
                 if discovery.elapsed() >= Duration::from_secs(1) || tails[i].is_none() {
@@ -364,11 +475,25 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, config: S
                 tails[i] = None;
             }
             if let Some(tail) = &mut tails[i] {
-                match tail.read(config.max_buffer_bytes) {
+                let read_start = Instant::now();
+                let read_us = unix_us();
+                let result = tail.read(config.max_buffer_bytes);
+                metrics.elapsed(["orders_file_read_us", "diffs_file_read_us", "fills_file_read_us"][i], read_start);
+                metrics.observe(
+                    ["orders_unread_bytes", "diffs_unread_bytes", "fills_unread_bytes"][i],
+                    tail.unread_bytes as f64,
+                );
+                match result {
                     Ok(lines) => {
+                        if lines.is_empty() {
+                            continue;
+                        }
+                        let lock_start = Instant::now();
                         let mut book = listener.lock().await;
+                        metrics.elapsed("listener_lock_wait_us", lock_start);
+                        let hold_start = Instant::now();
                         for line in lines {
-                            if let Err(err) = book.ingest(i, &line) {
+                            if let Err(err) = book.ingest_observed(i, &line, read_start, read_us) {
                                 if i == 2 {
                                     warn!("skipping malformed fill batch: {err}");
                                     book.fills = None;
@@ -379,6 +504,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, config: S
                                 break;
                             }
                         }
+                        metrics.elapsed("listener_lock_hold_us", hold_start);
                     }
                     Err(err) => {
                         listener.lock().await.recover(err, false);
@@ -452,12 +578,15 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, config: S
         }
         if diagnostic.elapsed() >= Duration::from_secs(30) {
             info!(
-                "feed state={:?} height={:?} upstream_time={:?} clients={} replay_bytes={}",
+                "feed state={:?} height={:?} upstream_time={:?} clients={} budget_counter_bytes={} retained_input_bytes={} order_blocks={} diff_blocks={}",
                 book.status.state,
                 book.status.height,
                 book.status.upstream_time,
                 book.internal_message_tx.receiver_count(),
-                book.buffered_bytes
+                book.buffered_bytes,
+                book.retained_input_bytes(),
+                book.orders.len(),
+                book.diffs.len()
             );
             diagnostic = Instant::now();
         }
@@ -477,10 +606,26 @@ pub(crate) struct TimedSnapshots {
 }
 pub(crate) enum InternalMessage {
     Status(FeedStatus),
-    Reset { generation: u64 },
-    Snapshot { generation: u64, height: u64, l2_snapshots: L2Snapshots, time: u64 },
-    Fills { batch: Batch<NodeDataFill> },
-    L4BookUpdates { generation: u64, diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
+    Reset {
+        generation: u64,
+    },
+    Snapshot {
+        generation: u64,
+        height: u64,
+        l2_snapshots: L2Snapshots,
+        time: u64,
+        trace: Option<Trace>,
+    },
+    Fills {
+        batch: Batch<NodeDataFill>,
+        trace: Option<Trace>,
+    },
+    L4BookUpdates {
+        generation: u64,
+        diff_batch: Batch<NodeDataOrderDiff>,
+        status_batch: Batch<NodeDataOrderStatus>,
+        trace: Option<Trace>,
+    },
 }
 #[derive(Eq, PartialEq, Hash)]
 pub(crate) struct L2SnapshotParams {
@@ -604,6 +749,22 @@ mod tests {
         book.config.max_buffer_bytes = 32;
         assert!(book.ingest(0, &batch(1, vec![])).is_err());
         assert!(book.ingest(1, "{").is_err());
+    }
+    #[test]
+    fn retained_bytes_track_fragments_and_clear_after_recovery() {
+        let mut book = listener(true);
+        let line = batch(101, vec![]);
+        book.ingest(0, &line).unwrap();
+        book.ingest(0, &line).unwrap();
+        book.ingest(1, &line).unwrap();
+        book.ingest(2, &line).unwrap();
+        assert_eq!(book.retained_input_bytes(), 4 * line.len());
+        // Internal accounting and timing must not leak into the node schema.
+        let encoded = serde_json::to_value(book.orders.get(&101).unwrap()).unwrap();
+        assert!(encoded.get("trace").is_none());
+        assert!(encoded.get("input_bytes").is_none());
+        book.recover("test recovery", false);
+        assert_eq!(book.retained_input_bytes(), 0);
     }
     #[test]
     fn stale_event_timestamp_not_published() {

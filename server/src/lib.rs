@@ -5,6 +5,7 @@ mod listeners;
 mod order_book;
 mod prelude;
 mod servers;
+mod telemetry;
 mod types;
 
 pub use prelude::Result;

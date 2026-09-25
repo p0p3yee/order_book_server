@@ -9,7 +9,7 @@ This was a standalone project, not written by the Hyperliquid Labs core team. It
 This server provides the `l2book` and `trades` endpoints from [Hyperliquid’s official API](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions), with roughly the same API.
 
 - The `l2book` subscription now includes an optional field:
-  `n_levels`, which can be up to `100` and defaults to `20`.
+  `nLevels`, which can be up to `100` and defaults to `20`.
 - This server also introduces a new endpoint: `l4book`.
 
 The `l4book` subscription first sends a snapshot of the entire book and then forwards order diffs by block. The subscription format is:
@@ -35,6 +35,12 @@ snapshots are **disabled by default**.
 See [DEPLOYMENT.md](DEPLOYMENT.md) for architecture, build/test commands, Docker/Compose,
 node flags, LAN API behavior, migration, actual-server checks, and remaining limitations.
 Streamed mode remains experimental until the node's output continuity is verified.
+
+See [INVESTIGATION.md](INVESTIGATION.md) for the September 25 LAN measurements,
+wallet API limitations, stage timing instrumentation, and host diagnostics commands.
+`/version`, `/capabilities`, and `/diagnostics` describe the running build and its
+bounded timing samples. Wallet subscriptions and WebSocket Info posts are not
+implemented; use node HTTP Info for supported queries such as `openOrders`.
 
 ```bash
 cargo fmt --check

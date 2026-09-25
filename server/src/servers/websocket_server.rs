@@ -2,6 +2,7 @@ use crate::{
     listeners::order_book::{InternalMessage, L2SnapshotParams, OrderBookListener, TimedSnapshots, hl_listen},
     order_book::{Coin, Snapshot},
     prelude::*,
+    telemetry::{self, SOCKET_TELEMETRY, SocketTelemetry},
     types::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
         inner::InnerLevel,
@@ -54,7 +55,17 @@ pub async fn run_websocket_server(
     let websocket_opts =
         yawc::Options::default().with_compression_level(yawc::CompressionLevel::new(compression_level));
     let health_listener = listener.clone();
+    let diagnostics_listener = listener.clone();
     let app = Router::new()
+        .route("/version", get(|| async { axum::Json(telemetry::version()) }))
+        .route("/capabilities", get(|| async { axum::Json(telemetry::capabilities()) }))
+        .route(
+            "/diagnostics",
+            get(move || {
+                let listener = diagnostics_listener.clone();
+                async move { axum::Json(listener.lock().await.diagnostics()) }
+            }),
+        )
         .route(
             "/health",
             get(move || {
@@ -81,7 +92,7 @@ pub async fn run_websocket_server(
         );
 
     let listener = TcpListener::bind(address).await?;
-    info!("WebSocket server running at ws://{address}");
+    info!("WebSocket server running at ws://{address} build={}", telemetry::version());
 
     if let Err(err) = axum::serve(listener, app.into_make_service()).await {
         error!("Server fatal error: {err}");
@@ -118,6 +129,21 @@ fn ws_handler(
 }
 
 async fn handle_socket(
+    socket: WebSocket,
+    tx: Sender<Arc<InternalMessage>>,
+    listener: Arc<Mutex<OrderBookListener>>,
+    ignore_spot: bool,
+) {
+    let metrics = listener.lock().await.metrics.clone();
+    SOCKET_TELEMETRY
+        .scope(
+            SocketTelemetry { metrics, trace: std::cell::RefCell::new(None) },
+            handle_socket_inner(socket, tx, listener, ignore_spot),
+        )
+        .await;
+}
+
+async fn handle_socket_inner(
     mut socket: WebSocket,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
@@ -133,6 +159,7 @@ async fn handle_socket(
             recv_result = internal_message_rx.recv() => {
                 match recv_result {
                     Ok(msg) => {
+                        telemetry::dispatch(msg.trace());
                         match msg.as_ref() {
                             InternalMessage::Status(status) => {
                                 if status.state == crate::listeners::order_book::Health::Ready
@@ -143,7 +170,7 @@ async fn handle_socket(
                                 if listener.lock().await.status.generation != *generation { continue; }
                                 refresh_books(&mut socket, &manager, &listener, &mut book_heights).await;
                             },
-                            InternalMessage::Snapshot{ generation, height, l2_snapshots, time } => {
+                            InternalMessage::Snapshot{ generation, height, l2_snapshots, time, .. } => {
                                 { let book = listener.lock().await;
                                   if !book.is_ready() || book.status.generation != *generation { continue; } }
 
@@ -154,14 +181,16 @@ async fn handle_socket(
                                     if matches!(sub, Subscription::L2Book { .. }) { book_heights.insert(sub.clone(), *height); }
                                 }
                             },
-                            InternalMessage::Fills{ batch } => {
+                            InternalMessage::Fills{ batch, .. } => {
                                 if !manager.subscriptions().iter().any(|s| matches!(s, Subscription::Trades { .. })) { continue; }
+                                let trade_start = std::time::Instant::now();
                                 let mut trades = coin_to_trades(batch);
+                                if let Some(metrics) = telemetry::socket_metrics() { metrics.elapsed("trade_reconstruct_us", trade_start); }
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
                                 }
                             },
-                            InternalMessage::L4BookUpdates{ generation, diff_batch, status_batch } => {
+                            InternalMessage::L4BookUpdates{ generation, diff_batch, status_batch, .. } => {
                                 { let book = listener.lock().await;
                                   if !book.is_ready() || book.status.generation != *generation { continue; } }
                                 if !manager.subscriptions().iter().any(|s| matches!(s, Subscription::L4Book { .. })) { continue; }
@@ -177,6 +206,8 @@ async fn handle_socket(
 
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        telemetry::dispatch(None);
+                        if let Some(metrics) = telemetry::socket_metrics() { metrics.observe("client_lagged_messages", n as f64); }
                         internal_message_rx = internal_message_tx.subscribe();
                         send_socket_message(&mut socket, ServerResponse::Error(format!("Client fell behind by {n} messages; book snapshots reset; trades may have gaps"))).await;
                         send_socket_message(&mut socket, ServerResponse::Status(listener.lock().await.status.clone())).await;
@@ -187,6 +218,7 @@ async fn handle_socket(
             }
 
             msg = socket.next() => {
+                telemetry::dispatch(None);
                 if let Some(frame) = msg {
                     match frame.opcode {
                         OpCode::Text => {
@@ -207,7 +239,7 @@ async fn handle_socket(
                                 demand.update(&manager);
                             }
                             else {
-                                let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
+                                let msg = ServerResponse::Error(unsupported_request_message(text));
                                 send_socket_message(&mut socket, msg).await;
                             }
                         }
@@ -295,11 +327,53 @@ async fn receive_client_message(
     }
 }
 
+fn unsupported_request_message(text: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        if value["method"] == "post" {
+            return "WebSocket post is not implemented by this server; use the node HTTP /info endpoint for supported Info queries. See /capabilities.".into();
+        }
+        if let Some(kind) = value["subscription"]["type"].as_str() {
+            if ["orderUpdates", "userFills", "openOrders"].contains(&kind) {
+                return format!(
+                    "Subscription {kind} is not implemented by this server. Supported: l2Book, trades, l4Book. See /capabilities."
+                );
+            }
+        }
+    }
+    "Invalid websocket request. Expected subscribe/unsubscribe with l2Book, trades, or l4Book; see /capabilities."
+        .into()
+}
+
 async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
+    let metrics = telemetry::socket_metrics();
+    let trace = telemetry::socket_trace();
+    let serialize_start = std::time::Instant::now();
     let msg = serde_json::to_string(&msg);
+    let serialization_us = serialize_start.elapsed().as_secs_f64() * 1e6;
+    if let Some(metrics) = &metrics {
+        metrics.observe("ws_serialize_us", serialization_us);
+    }
     match msg {
         Ok(msg) => {
-            if let Err(err) = socket.send(FrameView::text(msg)).await {
+            let send_start = std::time::Instant::now();
+            let send_begin_us = telemetry::unix_us();
+            let sent = socket.send(FrameView::text(msg)).await;
+            let send_end_us = telemetry::unix_us();
+            if let Some(metrics) = &metrics {
+                metrics.elapsed("ws_socket_send_us", send_start);
+                if let Some(t) = trace {
+                    metrics.elapsed("read_to_socket_send_complete_us", t.first_read);
+                    metrics.observe("event_age_at_send_us", (send_begin_us - t.block_us) as f64);
+                }
+            }
+            if let Some(t) = trace {
+                // Opt-in via RUST_LOG=info,latency=debug; sample one height in 100.
+                if t.height % 100 == 0 {
+                    log::debug!(target: "latency", "height={} block_us={} node_local_us={} file_read_us={} apply_done_us={} publish_us={} serialize_us={serialization_us:.0} send_begin_us={send_begin_us} send_end_us={send_end_us}",
+                        t.height,t.block_us,t.node_local_us,t.read_us,t.applied_us,t.published_us);
+                }
+            }
+            if let Err(err) = sent {
                 error!("Failed to send: {err}");
             }
         }

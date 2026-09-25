@@ -3,7 +3,8 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY server ./server
 COPY binaries ./binaries
-RUN cargo build --locked --release --bin websocket_server
+ARG SOURCE_REVISION=unknown
+RUN SOURCE_REVISION="$SOURCE_REVISION" cargo build --locked --release --bin websocket_server
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl \

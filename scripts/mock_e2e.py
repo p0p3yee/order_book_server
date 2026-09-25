@@ -155,6 +155,22 @@ def main():
                 ws.until('status', predicate=lambda m: m['data']['state'] == 'Ready')
                 ws.until('l2Book')
                 assert process.poll() is None
+                def endpoint(path):
+                    return json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/{path}',timeout=2))
+                assert endpoint('version')['implementation'] == 'hyperliquid-order-book-server/low-latency-ws'
+                capabilities = endpoint('capabilities')
+                assert capabilities['subscriptions'] == ['l2Book','trades','l4Book']
+                assert capabilities['wallet_subscriptions'] is False
+                diagnostic = endpoint('diagnostics')
+                for metric in ['book_apply_us','l2_aggregate_us','ws_dispatch_queue_us','ws_serialize_us','ws_socket_send_us','orders_node_local_to_read_us']:
+                    assert diagnostic['metrics'][metric]['count'] > 0, metric
+                assert 'retained_input_bytes' in diagnostic['backlog']
+                for kind in ['orderUpdates','userFills','openOrders']:
+                    ws.send({'method':'subscribe','subscription':{'type':kind,'user':'0x'+'0'*40}})
+                    assert 'not implemented' in ws.until('error')['data']
+                ws.send({'method':'post','id':1,'request':{'type':'info','payload':{'type':'exchangeStatus'}}})
+                assert 'not implemented' in ws.until('error')['data']
+                ws.until('l2Book')  # unsupported methods must not disconnect the market-data client
                 print(f'PASS ({"stream" if streamed else "batch"}): healthy >10s without snapshots; malformed fills; missed block; L4 reset; rotation; stale stream; HTTP failure; same WebSocket/process recovery')
             except Exception:
                 print(log_path.read_text(), file=sys.stderr)

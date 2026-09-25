@@ -30,7 +30,7 @@ impl<O: Clone> Snapshot<O> {
     }
 
     pub(crate) fn truncate(&self, n: usize) -> Self {
-        Self(self.0.clone().map(|orders| orders.into_iter().take(n).collect_vec()))
+        Self([self.0[0].iter().take(n).cloned().collect(), self.0[1].iter().take(n).cloned().collect()])
     }
 }
 

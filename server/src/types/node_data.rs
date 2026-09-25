@@ -56,6 +56,10 @@ pub(crate) struct Batch<E> {
     pub(crate) block_time: NaiveDateTime,
     pub(crate) block_number: u64,
     pub(crate) events: Vec<E>,
+    #[serde(skip)]
+    pub(crate) input_bytes: usize,
+    #[serde(skip)]
+    pub(crate) trace: Option<crate::telemetry::Trace>,
 }
 
 impl<E> Batch<E> {

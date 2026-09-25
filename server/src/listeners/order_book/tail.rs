@@ -11,6 +11,7 @@ pub(super) struct Tail {
     file: File,
     pending: Vec<u8>,
     skip_fragment: bool,
+    pub(super) unread_bytes: u64,
 }
 impl Tail {
     pub(super) fn open(path: PathBuf, at_end: bool) -> Result<Self> {
@@ -22,7 +23,7 @@ impl Tail {
             file.read_exact(&mut byte)?;
             skip_fragment = byte[0] != b'\n';
         }
-        Ok(Self { path, file, pending: Vec::new(), skip_fragment })
+        Ok(Self { path, file, pending: Vec::new(), skip_fragment, unread_bytes: 0 })
     }
     pub(super) fn path(&self) -> &Path {
         &self.path
@@ -45,11 +46,13 @@ impl Tail {
             return Err("upstream file truncated".into());
         }
         let available = self.file.metadata()?.len().saturating_sub(self.file.stream_position()?);
+        self.unread_bytes = available;
         if available == 0 {
             return Ok(Vec::new());
         }
         let mut chunk = vec![0; limit.min(4 * 1024 * 1024).min(available as usize)];
         let n = self.file.read(&mut chunk)?;
+        self.unread_bytes = available.saturating_sub(n as u64);
         self.pending.extend_from_slice(&chunk[..n]);
         if self.pending.len() > limit {
             self.pending.clear();
