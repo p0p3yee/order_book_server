@@ -17,20 +17,38 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 class WS:
-    def __init__(self, port, host="127.0.0.1"):
+    def __init__(self, port, host="127.0.0.1", compression=False):
         self.sock = socket.create_connection((host, port), timeout=5)
         key = base64.b64encode(os.urandom(16)).decode()
-        self.sock.sendall((f'GET /ws HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n').encode())
+        extension = 'Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n' if compression else ''
+        if compression == 'context': extension = 'Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n'
+        self.sock.sendall((f'GET /ws HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extension}\r\n').encode())
         self.file = self.sock.makefile('rb')
         assert b'101' in self.file.readline(), 'WebSocket upgrade failed'
-        while self.file.readline() != b'\r\n':
-            pass
+        self.compression = False
+        self.client_no_context = self.server_no_context = False
+        while True:
+            header = self.file.readline().lower()
+            if header == b'\r\n': break
+            assert header, 'incomplete handshake'
+            if header.startswith(b'sec-websocket-extensions:'):
+                self.compression = b'permessage-deflate' in header
+                self.client_no_context = b'client_no_context_takeover' in header
+                self.server_no_context = b'server_no_context_takeover' in header
+        self.compressor = zlib.compressobj(wbits=-15)
+        self.decompressor = zlib.decompressobj(wbits=-15)
     def send(self, data):
         payload = json.dumps(data).encode()
+        opcode = 0x81
+        if self.compression:
+            payload = (self.compressor.compress(payload) + self.compressor.flush(zlib.Z_SYNC_FLUSH))[:-4]
+            opcode |= 0x40
+            if self.client_no_context: self.compressor = zlib.compressobj(wbits=-15)
         mask = os.urandom(4)
-        header = bytes([0x81, 0x80 | len(payload)]) if len(payload) < 126 else bytes([0x81, 0xfe]) + struct.pack('!H', len(payload))
+        header = bytes([opcode, 0x80 | len(payload)]) if len(payload) < 126 else bytes([opcode, 0xfe]) + struct.pack('!H', len(payload))
         self.sock.sendall(header + mask + bytes(v ^ mask[i % 4] for i, v in enumerate(payload)))
     def recv(self):
         head = self.file.read(2)
@@ -40,6 +58,10 @@ class WS:
         if size == 127: size = struct.unpack('!Q', self.file.read(8))[0]
         payload = self.file.read(size)
         assert head[0] & 15 != 8, 'WebSocket close frame'
+        if head[0] & 0x40:
+            assert self.compression, 'unexpected compressed response'
+            payload = self.decompressor.decompress(payload + b'\x00\x00\xff\xff')
+            if self.server_no_context: self.decompressor = zlib.decompressobj(wbits=-15)
         return json.loads(payload)
     def until(self, channel, timeout=10, predicate=lambda m: True):
         deadline = time.monotonic() + timeout

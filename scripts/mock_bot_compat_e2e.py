@@ -116,6 +116,11 @@ def main():
                     if ch=='walletStatus' and 'sampleCompletedAt' in data:
                         assert 0<=data['sampleCompletedAt']-data['sampleStartedAt']<=1000
                         assert data['atomic'] is False and data['generation']==0
+            with urllib.request.urlopen(f'http://127.0.0.1:{port}/listener-lock',timeout=1) as response:
+                observed_lock=json.load(response)
+            assert observed_lock['server']['implementation'].endswith('/low-latency-ws')
+            assert observed_lock['listenerLock']['acquisitions'] > 0
+            assert isinstance(observed_lock['listenerLock']['waiters'],int)
             ws=clients[0]
             # Distinct identity forms and observed status cases preserve payload and request correlation.
             records={status:full_order(100+i) for i,status in enumerate(['open','canceled','filled'])}
@@ -129,6 +134,17 @@ def main():
                 result=response['payload']['data'];assert result['status']=='order' and result['order']['status']==status
                 assert result['order']['order']==order
             assert lookup(ws,records['canceled']['cloid'],81)['payload']['data']['order']['status']=='canceled'
+            # Dedicated metadata sockets have no subscriptions or wallet timer.
+            for compression in (False, True, "context"):
+                metadata=WS(port,compression=compression);metadata.wallet=USERS[0];clients.append(metadata)
+                assert metadata.compression == bool(compression), 'compression negotiation differs from test mode'
+                metadata.until('status')
+                time.sleep(.2)
+                for i,oid in enumerate([records['open']['oid'],records['canceled']['oid'],999999]):
+                    started=time.monotonic()
+                    response=lookup(metadata,oid,900+i)
+                    assert time.monotonic()-started < 1, 'post-only socket response starved'
+                    assert response['type'] in ('info','error'), response
             missing=lookup(ws,999999,82);assert missing['type']=='error' and missing['payload'].startswith('LOCAL_HISTORY_UNAVAILABLE:')
             with lock:state['fills']=[[USERS[0],dict(coin='xyz:TEST',px='20.0',sz='0.1',side='B',time=now(),startPosition='0',dir='Open Long',closedPnl='0',hash='synthetic',oid=100,crossed=True,fee='0',tid=1,feeToken='USDC')]]
             until(ws,'userFills',lambda m:not m['data']['isSnapshot'])

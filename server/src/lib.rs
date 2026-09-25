@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod config;
 pub use config::ServerConfig;
+mod listener_lock;
 mod listeners;
 mod order_book;
 mod prelude;

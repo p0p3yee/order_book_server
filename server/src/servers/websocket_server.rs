@@ -1,4 +1,5 @@
 use super::info::{InfoBridge, MAX_PENDING, PostRequest, PostResponse};
+use crate::listener_lock::Mutex;
 use crate::{
     listeners::order_book::{InternalMessage, L2SnapshotParams, OrderBookListener, TimedSnapshots, hl_listen},
     order_book::{Coin, Snapshot},
@@ -21,10 +22,7 @@ use std::{
 use tokio::select;
 use tokio::{
     net::TcpListener,
-    sync::{
-        Mutex,
-        broadcast::{Sender, channel},
-    },
+    sync::broadcast::{Sender, channel},
 };
 use yawc::{FrameView, OpCode, WebSocket};
 
@@ -47,6 +45,7 @@ pub async fn run_websocket_server(
         book
     };
     let listener = Arc::new(Mutex::new(listener));
+    listener.lock().await.lock_diagnostics = Some(listener.diagnostics());
     {
         let listener = listener.clone();
         tokio::spawn(async move {
@@ -61,7 +60,17 @@ pub async fn run_websocket_server(
         yawc::Options::default().with_compression_level(yawc::CompressionLevel::new(compression_level));
     let health_listener = listener.clone();
     let diagnostics_listener = listener.clone();
+    let lock_diagnostics = listener.diagnostics();
     let app = Router::new()
+        .route(
+            "/listener-lock",
+            get(move || {
+                let diagnostics = lock_diagnostics.clone();
+                async move {
+                    axum::Json(serde_json::json!({"server":telemetry::version(),"listenerLock":diagnostics.snapshot()}))
+                }
+            }),
+        )
         .route("/version", get(|| async { axum::Json(telemetry::version()) }))
         .route("/capabilities", get(|| async { axum::Json(telemetry::capabilities()) }))
         .route(

@@ -1,3 +1,4 @@
+use crate::listener_lock::Mutex;
 use crate::{
     ServerConfig,
     order_book::{
@@ -23,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tail::{Tail, latest_file};
-use tokio::sync::{Mutex, broadcast::Sender};
+use tokio::sync::broadcast::Sender;
 use utils::{process_rmp_file, validate_snapshot_consistency};
 mod state;
 mod tail;
@@ -49,6 +50,7 @@ pub(crate) struct FeedStatus {
 
 /// One owner applies book mutations and publishes them synchronously in block order.
 pub(crate) struct OrderBookListener {
+    pub(crate) lock_diagnostics: Option<Arc<crate::listener_lock::Diagnostics>>,
     config: ServerConfig,
     state: Option<OrderBookState>,
     checkpoint: Option<OrderBookState>,
@@ -70,6 +72,7 @@ pub(crate) struct OrderBookListener {
 impl OrderBookListener {
     pub(crate) fn new(tx: Sender<Arc<InternalMessage>>, config: ServerConfig) -> Self {
         Self {
+            lock_diagnostics: None,
             config,
             state: None,
             checkpoint: None,
@@ -113,6 +116,7 @@ impl OrderBookListener {
         self.send(InternalMessage::Status(self.status.clone()));
     }
     fn recover(&mut self, reason: impl ToString, stale: bool) {
+        let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("recovery"));
         let reason = reason.to_string();
         let repeated = self.state.is_none() && self.status.reason == reason;
         if !repeated {
@@ -136,9 +140,11 @@ impl OrderBookListener {
         }
     }
     pub(crate) fn compute_snapshot(&self) -> Option<TimedSnapshots> {
+        let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("l4Snapshot"));
         if self.is_ready() { self.state.as_ref().map(OrderBookState::compute_snapshot) } else { None }
     }
     pub(crate) fn current_l2(&mut self, subscription: &Subscription) -> Option<(u64, L2Snapshots)> {
+        let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("immediateL2"));
         let requested = l2_requests(std::iter::once(subscription));
         if self.is_ready() { self.state.as_mut().and_then(|s| s.l2_snapshots(false, &requested)) } else { None }
     }
@@ -146,6 +152,7 @@ impl OrderBookListener {
         Snapshots::new(snapshot.value().into_iter().filter(|(c, _)| self.config.includes(&c.value())).collect())
     }
     fn install(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) -> Result<()> {
+        let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("installSnapshot"));
         let snapshot = self.selected_snapshot(snapshot);
         if let Some(mut checkpoint) = self.checkpoint.take() {
             let validation = (|| -> Result<()> {
@@ -193,22 +200,32 @@ impl OrderBookListener {
         self.ingest_observed(source, line, Instant::now(), unix_us())
     }
     pub(crate) fn diagnostics(&self) -> serde_json::Value {
+        let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("diagnostics"));
         let requested = {
+            let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("demandRegistry"));
             let demand = self.l2_subscriptions.lock().unwrap_or_else(|e| e.into_inner());
             l2_requests(demand.keys())
+        };
+        let wallet = {
+            let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("diagnostics.wallet"));
+            self.wallet.as_ref().map(|w| w.diagnostics())
+        };
+        let metrics = {
+            let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("diagnostics.metrics"));
+            self.metrics.snapshot()
         };
         serde_json::json!({"status":self.status,"server":crate::telemetry::version(),
             "config":{"poll_interval_ms":self.config.poll_interval.as_millis(),
                 "stale_after_ms":self.config.stale_after.as_millis(),
                 "stream_with_block_info":self.config.stream_with_block_info,
                 "integrity_interval_secs":self.config.integrity_interval.as_secs()},
-            "wallet":self.wallet.as_ref().map(|w|w.diagnostics()),
+            "wallet":wallet,
             "l2_demand":{"markets":requested.len(),"variants":requested.values().map(HashSet::len).sum::<usize>()},
             "backlog":{"order_blocks":self.orders.len(),"diff_blocks":self.diffs.len(),
                 "retained_input_bytes":self.retained_input_bytes(),
                 "budget_accounting_counter_bytes":self.buffered_bytes,
                 "note":"retained_input_bytes counts original record bytes for retained blocks, not process RSS"},
-            "metrics":self.metrics.snapshot(),
+            "metrics":metrics,
             "clock_note":"duration metrics use monotonic time; node/output timestamps need synchronized clocks; socket send completion is not client receipt"})
     }
     fn retained_input_bytes(&self) -> usize {
@@ -217,6 +234,7 @@ impl OrderBookListener {
             + self.fills.as_ref().map_or(0, |b| b.input_bytes)
     }
     fn ingest_observed(&mut self, source: usize, line: &str, first_read: Instant, read_us: i64) -> Result<()> {
+        let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("ingestRecord"));
         let ingest_start = Instant::now();
         self.buffered_bytes = self.buffered_bytes.saturating_add(line.len());
         if self.buffered_bytes > self.config.max_buffer_bytes {
@@ -299,6 +317,7 @@ impl OrderBookListener {
         }
     }
     fn drain(&mut self) -> Result<()> {
+        let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("drain"));
         while let Some(state) = self.state.as_mut() {
             let next = state.height() + 1;
             self.orders.retain(|h, _| *h >= next);
@@ -331,7 +350,10 @@ impl OrderBookListener {
                 }
             }
             let apply_start = Instant::now();
-            state.apply_updates(orders.clone(), diffs.clone())?;
+            {
+                let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("applyUpdates"));
+                state.apply_updates(orders.clone(), diffs.clone())?;
+            }
             self.metrics.elapsed("book_apply_us", apply_start);
             if let Some(t) = &mut trace {
                 t.applied_us = unix_us();
@@ -372,10 +394,12 @@ impl OrderBookListener {
             }
         }
         let requested = {
+            let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("demandRegistry"));
             let demand = self.l2_subscriptions.lock().unwrap_or_else(|e| e.into_inner());
             l2_requests(demand.keys())
         };
         if self.is_ready() && !requested.is_empty() {
+            let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("l2Aggregate"));
             let l2_start = Instant::now();
             if let Some((time, l2_snapshots)) = self.state.as_mut().and_then(|s| s.l2_snapshots(true, &requested)) {
                 self.metrics.elapsed("l2_aggregate_us", l2_start);
@@ -601,6 +625,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, config: S
             }));
         }
         if diagnostic.elapsed() >= Duration::from_secs(30) {
+            let _phase = book.lock_diagnostics.as_ref().map(|d| d.phase("periodicLog"));
             info!(
                 "feed state={:?} height={:?} upstream_time={:?} clients={} budget_counter_bytes={} retained_input_bytes={} order_blocks={} diff_blocks={}",
                 book.status.state,

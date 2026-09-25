@@ -97,3 +97,34 @@ writer that never completes. This establishes a code defect, not a confirmed
 attribution for a particular production timeout. A blocked writer can still stall
 its own client task; this patch isolates shared book progress without adding new
 client timeout/disconnection policy.
+
+## Independent listener-lock diagnostics
+
+`GET /listener-lock` reports the build revision and `listenerLock`: current owner
+source basename/line, current `heldUs`, session `maxHoldUs`, acquisitions, waiters,
+and current synchronous phase with elapsed microseconds. It does not acquire the
+book mutex, wallet mutex, demand registry, or existing metrics locks. Source paths
+are reduced to basenames. Counters and the single current owner/phase use fixed
+memory. A short independent metadata lock protects copies; JSON construction takes
+place after releasing it. No per-acquisition log messages are emitted.
+
+Phases identify record ingestion, contiguous drain, update application, L2
+aggregation, L4 snapshot construction, snapshot installation, recovery, demand
+registry access, wallet/metrics diagnostics, and periodic logging. Nested phases
+restore their parent on exit. Cancellation removes waiters and releases owner
+metadata with the original mutex guard. The underlying Tokio mutex and all
+publication checks are preserved; instrumentation does not unlock stalled work.
+
+If `/version` responds while `/health` and new WS greetings stall, capture
+`/listener-lock` repeatedly using the matching source revision. An unchanged owner
+and acquisition count with increasing hold time identifies a blocked critical
+section; a changing count indicates progress/contended access instead. This endpoint
+is diagnostic, not proof of book readiness. A stuck synchronous operation can still
+consume a runtime thread, and this does not fix its cause or guarantee availability
+if all runtime threads are blocked.
+
+Local tests cover cancellation, nested phases, observing a held lock while another
+acquisition waits, and status-write isolation. The compatibility process test also
+queries dedicated idle Info sockets with uncompressed frames, permessage-deflate
+without context takeover, and with context takeover. These tests have not reproduced
+the production stall. Its remaining root cause requires holder/host stack evidence.
