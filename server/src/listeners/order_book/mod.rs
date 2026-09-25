@@ -202,7 +202,7 @@ impl OrderBookListener {
                 "stale_after_ms":self.config.stale_after.as_millis(),
                 "stream_with_block_info":self.config.stream_with_block_info,
                 "integrity_interval_secs":self.config.integrity_interval.as_secs()},
-            "wallet":self.wallet.as_ref().map(|w|w.status()),
+            "wallet":self.wallet.as_ref().map(|w|w.diagnostics()),
             "l2_demand":{"markets":requested.len(),"variants":requested.values().map(HashSet::len).sum::<usize>()},
             "backlog":{"order_blocks":self.orders.len(),"diff_blocks":self.diffs.len(),
                 "retained_input_bytes":self.retained_input_bytes(),

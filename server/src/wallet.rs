@@ -3,7 +3,9 @@
 mod accounts;
 pub(crate) use accounts::Sample as AccountSample;
 mod aggregate;
+mod gate;
 mod orders;
+use gate::{Gate, Reason as GateReason};
 mod storage;
 use crate::ServerConfig;
 use serde::{Deserialize, Serialize};
@@ -111,6 +113,7 @@ struct State {
     sources: [Source; 2],
     ready: bool,
     history_current: bool,
+    history_gate: Gate,
     reason: String,
     journal_error: Option<String>,
     gaps: u64,
@@ -140,6 +143,7 @@ impl State {
             sources: [Source::default(), Source::default()],
             ready: false,
             history_current: false,
+            history_gate: Gate::new(Instant::now()),
             reason: "startup: loading retained history and resuming input cursors".into(),
             journal_error: None,
             gaps: 0,
@@ -154,6 +158,10 @@ impl State {
     // Readiness gates publication; epoch identifies continuity, not scheduling.
     // Catching up retained input or waiting for fresh upstream data preserves
     // cursors. Actual gaps and persistence failures invalidate continuity below.
+    fn set_history_gate(&mut self, reason: GateReason) {
+        self.history_current = reason == GateReason::Current;
+        self.history_gate.set(reason, Instant::now());
+    }
     fn sources_fresh(&self, stale_after: Duration) -> bool {
         let now = chrono::Utc::now().timestamp_millis();
         self.sources
@@ -168,8 +176,8 @@ impl State {
             return false;
         }
         self.ready = ready;
-        if !ready {
-            self.history_current = false;
+        if !ready && self.history_current {
+            self.set_history_gate(GateReason::StaleInput);
         }
         self.replaying = !ready;
         self.reason = if ready {
@@ -184,7 +192,7 @@ impl State {
         self.epoch += 1;
         self.gaps += 1;
         self.ready = false;
-        self.history_current = false;
+        self.set_history_gate(GateReason::Gap);
         self.sources = [Source::default(), Source::default()];
         self.reason = reason;
     }
@@ -455,7 +463,20 @@ impl WalletHub {
         Ok(())
     }
     pub(crate) fn status(&self) -> Value {
-        let mut status = self.state.lock().unwrap_or_else(|e| e.into_inner()).status();
+        self.status_inner(false)
+    }
+    pub(crate) fn diagnostics(&self) -> Value {
+        self.status_inner(true)
+    }
+    fn status_inner(&self, include_gate: bool) -> Value {
+        let mut status = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut status = state.status();
+            if include_gate {
+                status["historyGate"] = state.history_gate.snapshot(Instant::now());
+            }
+            status
+        };
         status["enabled"] = json!(self.enabled());
         status["configuredWallets"] = json!(self.allowed.len());
         status["storage"] = json!("SQLite WAL with transactional source cursors");
@@ -547,6 +568,12 @@ impl WalletHub {
         (status, messages, (s.epoch, next_seq), reset)
     }
 }
+fn source_read_order(orders: Option<u64>, fills: Option<u64>) -> [usize; 2] {
+    if orders.zip(fills).is_some_and(|(o, f)| o > f) { [1, 0] } else { [0, 1] }
+}
+fn reader_delay(poll: Duration, caught_up: bool, aligned: bool, persistence_failed: bool) -> Duration {
+    if !persistence_failed && (!caught_up || !aligned) { poll.min(Duration::from_millis(1)) } else { poll }
+}
 fn run_worker(
     config: ServerConfig,
     state: Arc<Mutex<State>>,
@@ -586,16 +613,21 @@ fn run_worker(
     // before the next checkpoint can then replay those records from these anchors.
     let (pending, seq, coverage) = {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.set_history_gate(GateReason::Commit);
         (std::mem::take(&mut s.pending), s.seq, s.coverage_start)
     };
     let initial = store.commit(&pending, &checkpoints, seq, &gaps, &config, coverage);
     let mut persistence_failed = initial.is_err();
     match initial {
-        Ok(()) => gaps.clear(),
+        Ok(()) => {
+            gaps.clear();
+            state.lock().unwrap_or_else(|e| e.into_inner()).set_history_gate(GateReason::AwaitingRecheck);
+        }
         Err(error) => {
             let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
             s.pending = pending;
             s.journal_error = Some(error.to_string());
+            s.set_history_gate(GateReason::Persistence);
             s.reason = "initial wallet checkpoint blocked; retrying before ingestion".into();
         }
     }
@@ -609,9 +641,13 @@ fn run_worker(
         }
         // Publication may tolerate brief backlog, but history-derived answers
         // must never use an open record ahead of the fill reader in this pass.
-        state.lock().unwrap_or_else(|e| e.into_inner()).history_current = false;
+        let read_order = {
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.set_history_gate(if persistence_failed { GateReason::Persistence } else { GateReason::InputPass });
+            source_read_order(s.sources[0].height, s.sources[1].height)
+        };
         if !persistence_failed {
-            for i in 0..2 {
+            for i in read_order {
                 if readers[i].is_none() && last_discovery.elapsed() >= Duration::from_secs(1) {
                     readers[i] = storage::Reader::open(dirs[i].clone(), None).ok();
                 }
@@ -664,8 +700,16 @@ fn run_worker(
                             s.replaying = was_replaying;
                             // Enforce age before notifying subscribers about each batch,
                             // not only after the whole bounded read pass completes.
-                            if !s.sources_fresh(config.stale_after) && s.set_ready(false) {
-                                signal.send_modify(|n| *n += 1);
+                            if !s.sources_fresh(config.stale_after) {
+                                let reason = if s.sources.iter().any(|source| source.height.is_none()) {
+                                    if s.gaps > 0 { GateReason::Gap } else { GateReason::Initializing }
+                                } else {
+                                    GateReason::StaleInput
+                                };
+                                s.set_history_gate(reason);
+                                if s.set_ready(false) {
+                                    signal.send_modify(|n| *n += 1);
+                                }
                             }
                             checkpoints[i].height = s.sources[i].height;
                             checkpoints[i].time = s.sources[i].block_time;
@@ -714,15 +758,30 @@ fn run_worker(
         metrics.observe("backlog_age_us", backlog_age.as_secs_f64() * 1e6);
         let fresh = s.sources_fresh(config.stale_after);
         let ready = s.can_publish(caught_up, backlog_age, fresh, persistence_failed);
+        let aligned = s.sources[0].height.is_some() && s.sources[0].height == s.sources[1].height;
+        let gate = if persistence_failed {
+            GateReason::Persistence
+        } else if s.sources.iter().any(|source| source.height.is_none()) {
+            if s.gaps > 0 { GateReason::Gap } else { GateReason::Initializing }
+        } else if !fresh {
+            GateReason::StaleInput
+        } else if !caught_up {
+            GateReason::Backlog
+        } else if !aligned {
+            GateReason::HeightSkew
+        } else if ready {
+            GateReason::Current
+        } else {
+            GateReason::Backlog
+        };
+        s.set_history_gate(gate);
         if s.set_ready(ready) {
             signal.send_modify(|n| *n += 1);
         }
-        s.history_current =
-            ready && caught_up && s.sources[0].height.is_some() && s.sources[0].height == s.sources[1].height;
         if last_commit.elapsed() >= Duration::from_secs(1) || (!persistence_failed && s.pending.len() >= 256) {
             // pending leaves State while SQLite commits. Do not allow a lookup
             // to mistake that temporary absence for fully persisted history.
-            s.history_current = false;
+            s.set_history_gate(GateReason::Commit);
             let pending = std::mem::take(&mut s.pending);
             let seq = s.seq;
             let coverage = s.coverage_start;
@@ -738,6 +797,7 @@ fn run_worker(
                     }
                     persistence_failed = false;
                     gaps.clear();
+                    s.set_history_gate(GateReason::AwaitingRecheck);
                 }
                 Err(error) => {
                     let reason = error.to_string();
@@ -751,7 +811,7 @@ fn run_worker(
                         s.epoch += 1;
                     }
                     s.ready = false;
-                    s.history_current = false;
+                    s.set_history_gate(GateReason::Persistence);
                     s.reason = "wallet persistence blocked; source cursors retained for retry".into();
                     persistence_failed = true;
                 }
@@ -762,11 +822,7 @@ fn run_worker(
         }
         // Catch-up remains byte/record bounded, but avoid adding the idle polling
         // delay on every backlog chunk. This worker is independent of the book loop.
-        let delay = if !persistence_failed && !caught_up {
-            config.poll_interval.min(Duration::from_millis(1))
-        } else {
-            config.poll_interval
-        };
+        let delay = reader_delay(config.poll_interval, caught_up, aligned, persistence_failed);
         std::thread::sleep(delay);
     }
     // Graceful worker teardown when used by tests/embedders. Abrupt process exits
@@ -1045,6 +1101,24 @@ mod tests {
         let mut bad = event;
         bad["order"].as_object_mut().unwrap().remove("origSz");
         assert!(decode(0, &batch(1, json!([bad])), &allowed).is_err());
+    }
+    #[test]
+    fn lagging_reader_is_prioritized_with_positive_bounded_sleep() {
+        assert_eq!(source_read_order(Some(10), Some(9)), [1, 0]);
+        assert_eq!(source_read_order(Some(9), Some(10)), [0, 1]);
+        assert_eq!(source_read_order(Some(10), Some(10)), [0, 1]);
+        let poll = Duration::from_millis(5);
+        assert_eq!(reader_delay(poll, true, false, false), Duration::from_millis(1));
+        assert_eq!(reader_delay(poll, false, false, false), Duration::from_millis(1));
+        assert_eq!(reader_delay(poll, true, true, false), poll);
+        assert_eq!(reader_delay(poll, true, false, true), poll);
+        for caught_up in [false, true] {
+            for aligned in [false, true] {
+                for failed in [false, true] {
+                    assert!(!reader_delay(poll, caught_up, aligned, failed).is_zero());
+                }
+            }
+        }
     }
     #[test]
     fn backlog_grace_never_masks_stale_input_startup_or_journal_failure() {

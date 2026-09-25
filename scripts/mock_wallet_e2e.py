@@ -22,8 +22,9 @@ OTHER = '0x0000000000000000000000000000000000000002'
 def main():
     streamed = '--stream' in sys.argv
     large_records = '--large-records' in sys.argv
+    reader_skew = '--reader-skew' in sys.argv
     binary = Path('target/release/websocket_server').resolve()
-    state = dict(height=100, stop=False, pause=False, fills=[], orders=[], open=[], fail=False, slow=False, skip=False, queries=0)
+    state = dict(height=100, stop=False, pause=False, fills=[], orders=[], open=[], fail=False, slow=False, skip=False, queries=0, hold_fills=False)
     lock = threading.Lock()
     with tempfile.TemporaryDirectory(prefix='wallet-e2e-') as temp:
         root = Path(temp)
@@ -54,6 +55,7 @@ def main():
         httpd = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         def producer():
+            held_fills = []
             while True:
                 time.sleep(.04)
                 with lock:
@@ -65,7 +67,12 @@ def main():
                     for i, p in enumerate(paths):
                         events = state['orders'] if i == 0 else state['fills'] if i == 2 else []
                         batch = dict(local_time=now, block_time=now, block_number=state['height'], events=events)
+                        if i == 2 and state['hold_fills']:
+                            held_fills.append(json.dumps(batch) + '\n')
+                            continue
                         with p.open('a') as f:
+                            if i == 2 and held_fills:
+                                f.writelines(held_fills); held_fills.clear()
                             # Multiple same-height fragments in stream mode; identical timestamps.
                             if streamed and events:
                                 for e in events: f.write(json.dumps(dict(batch, events=[e])) + '\n')
@@ -134,6 +141,55 @@ def main():
             order = dict(coin='@1', side='A', limitPx='1', sz='2', origSz='5', oid=999, timestamp=123,
                 triggerCondition='N/A', isTrigger=False, triggerPx='0', isPositionTpsl=False,
                 reduceOnly=False, orderType='Limit', tif='Gtc', cloid=None)
+            if reader_skew:
+                def diagnostic():
+                    with urllib.request.urlopen(f'http://127.0.0.1:{port}/diagnostics', timeout=2) as r:
+                        return json.load(r)['wallet']
+                with lock:
+                    state['hold_fills'] = True
+                    state['orders'] = [dict(user=USER, time=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(), status='open', order=order)]
+                    state['fills'] = [[USER, dict(fill, oid=order['oid'])]]
+                deadline = time.monotonic() + 3
+                while True:
+                    start = diagnostic()
+                    if start['orderHeight'] > start['fillHeight']: break
+                    assert time.monotonic() < deadline, 'reader skew not observed'
+                    time.sleep(.005)
+                assert start['historyCurrent'] is False
+                started = time.monotonic()
+                time.sleep(.25)
+                end = diagnostic()
+                elapsed = time.monotonic() - started
+                assert end['generation'] == start['generation'] and end['gaps'] == start['gaps']
+                assert end['historyCurrent'] is False
+                before, after = start['historyGate'], end['historyGate']
+                assert after['byReason']['heightSkew']['totalUs'] > before['byReason']['heightSkew']['totalUs']
+                passes = after['byReason']['inputPass']['entries'] - before['byReason']['inputPass']['entries']
+                assert passes < elapsed * 2000 + 20, f'busy-spin suspected: {passes} passes in {elapsed}s'
+                assert after['blockedUs'] >= before['blockedUs']
+                request = dict(method='post',id=400,request=dict(type='info',payload=dict(type='orderStatus',user=USER,oid=order['oid'])))
+                a.send(request)
+                blocked = a.until('post')['data']['response']
+                assert blocked['type'] == 'error' and 'LOCAL_HISTORY_UNAVAILABLE' in blocked['payload'], blocked
+                with lock: state['hold_fills'] = False
+                deadline = time.monotonic() + 3
+                while True:
+                    ready = diagnostic()
+                    if ready['historyCurrent'] and ready['orderHeight'] == ready['fillHeight']: break
+                    assert time.monotonic() < deadline, 'reader did not catch up'
+                    time.sleep(.005)
+                # Once caught up, the real later fill must invalidate the old open record.
+                deadline = time.monotonic() + 3
+                while True:
+                    a.send(dict(request,id=401))
+                    checked = a.until('post')['data']['response']
+                    assert checked['type'] == 'error' and 'LOCAL_HISTORY_UNAVAILABLE' in checked['payload'], checked
+                    if 'subsequent fill' in checked['payload']: break
+                    assert time.monotonic() < deadline, 'fill evidence never reached lookup'
+                    time.sleep(.005)
+                assert ready['generation'] == start['generation'] and ready['gaps'] == start['gaps']
+                print('PASS reader skew: monotonic gate accounting, bounded polls, no false open before/after pending fill')
+                return
             with lock:
                 state['orders'] = [dict(user=USER, time=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(), status='canceled', order=order)]
                 state['fills'] = [[USER, fill], [USER, fill], [OTHER, dict(fill, tid=124)]]

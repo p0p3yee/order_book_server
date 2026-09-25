@@ -347,3 +347,28 @@ merely from pulling the repository.
 
 See [BOT_HANDOFF.md](BOT_HANDOFF.md) for the independently reviewed bot contract,
 producer epoch semantics, and staged integration/deployment gates.
+
+### Exact history gate diagnostics
+
+`/diagnostics.wallet.historyGate` uses monotonic time and a fixed ten-reason
+counter array. It records transitions even between HTTP polls. `byReason` gives
+exclusive phase `entries`, `totalUs`, and `maxUs`; the current interval is included.
+Reasons distinguish initialization, current history, input passes, height skew,
+backlog, stale input, gaps, commits, persistence failures, and awaiting a recheck.
+These are phases of the lookup gate, not measurements of node execution time.
+
+`currentBlockedUs` measures the ongoing false interval; `maxBlockedUs` measures the
+longest entire false interval across reason changes, including initialization.
+`blockedTransitions` counts current-to-blocked transitions (not initial startup).
+`transitions` counts all reason changes. Counters reset with the process. Within
+one process session, delta `blockedUs` / delta `observedUs` measures the blocked
+fraction without inferring outage duration from periodically sampled booleans.
+Ordinary walletStatus messages do not include these extra diagnostics.
+
+At EOF with unequal wallet source heights, the worker reads the lagging source
+first and uses a positive sleep capped at one millisecond until aligned. Both
+sources retain their per-pass budgets. Equal complete heights, freshness, and
+persistence checks are unchanged; the publication grace is not increased.
+`python3 scripts/mock_wallet_e2e.py --reader-skew` (also with `--stream`) withholds
+fills, checks rejection during skew and bounded polling, then releases them and
+checks recovery without a gap or generation reset.
