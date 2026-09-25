@@ -151,7 +151,8 @@ async fn handle_socket_inner(
 ) {
     let mut internal_message_rx = internal_message_tx.subscribe();
     let mut manager = SubscriptionManager::default();
-    let mut demand = L2Demand { count: 0, counter: listener.lock().await.l2_subscriptions.clone() };
+    let mut demand =
+        L2Demand { subscriptions: HashSet::new(), registry: listener.lock().await.l2_subscriptions.clone() };
     let mut book_heights = HashMap::<Subscription, u64>::new();
     send_socket_message(&mut socket, ServerResponse::Status(listener.lock().await.status.clone())).await;
     loop {
@@ -493,7 +494,7 @@ impl Subscription {
     ) -> Result<Option<(ServerResponse, u64)>> {
         if let Self::L2Book { coin, n_sig_figs, n_levels, mantissa } = self {
             let mut book = listener.lock().await;
-            if let Some((time, snapshots)) = book.current_l2() {
+            if let Some((time, snapshots)) = book.current_l2(self) {
                 if let Some(snapshot) = snapshots
                     .as_ref()
                     .get(&Coin::new(coin))
@@ -601,22 +602,58 @@ mod trade_tests {
 
 // Demand is removed even when a socket task is cancelled or the peer closes unexpectedly.
 struct L2Demand {
-    count: usize,
-    counter: Arc<std::sync::atomic::AtomicUsize>,
+    subscriptions: HashSet<Subscription>,
+    registry: Arc<std::sync::Mutex<HashMap<Subscription, usize>>>,
 }
 impl L2Demand {
     fn update(&mut self, manager: &SubscriptionManager) {
-        let next = manager.subscriptions().iter().filter(|s| matches!(s, Subscription::L2Book { .. })).count();
-        if next > self.count {
-            self.counter.fetch_add(next - self.count, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            self.counter.fetch_sub(self.count - next, std::sync::atomic::Ordering::Relaxed);
+        self.replace(
+            manager.subscriptions().iter().filter(|s| matches!(s, Subscription::L2Book { .. })).cloned().collect(),
+        );
+    }
+    fn replace(&mut self, next: HashSet<Subscription>) {
+        let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        for sub in self.subscriptions.difference(&next) {
+            if let Some(count) = registry.get_mut(sub) {
+                *count -= 1;
+                if *count == 0 {
+                    registry.remove(sub);
+                }
+            }
         }
-        self.count = next;
+        for sub in next.difference(&self.subscriptions) {
+            *registry.entry(sub.clone()).or_default() += 1;
+        }
+        self.subscriptions = next;
     }
 }
 impl Drop for L2Demand {
     fn drop(&mut self) {
-        self.counter.fetch_sub(self.count, std::sync::atomic::Ordering::Relaxed);
+        self.replace(HashSet::new());
+    }
+}
+
+#[cfg(test)]
+mod demand_tests {
+    use super::*;
+    #[test]
+    fn demand_survives_other_clients_unsubscribe_and_cleans_up_on_drop() {
+        let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let sub = Subscription::L2Book { coin: "BTC".into(), n_sig_figs: None, n_levels: Some(5), mantissa: None };
+        let mut manager = SubscriptionManager::default();
+        manager.subscribe(sub.clone());
+        let mut first = L2Demand { subscriptions: HashSet::new(), registry: registry.clone() };
+        let mut second = L2Demand { subscriptions: HashSet::new(), registry: registry.clone() };
+        first.update(&manager);
+        first.update(&manager); // Duplicate update must not double-count demand.
+        second.update(&manager);
+        assert_eq!(registry.lock().unwrap()[&sub], 2);
+        manager.unsubscribe(sub.clone());
+        first.update(&manager);
+        assert_eq!(registry.lock().unwrap()[&sub], 1);
+        drop(first);
+        assert_eq!(registry.lock().unwrap()[&sub], 1);
+        drop(second);
+        assert!(registry.lock().unwrap().is_empty());
     }
 }

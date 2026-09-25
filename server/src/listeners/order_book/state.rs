@@ -1,5 +1,5 @@
 use crate::{
-    listeners::order_book::{L2Snapshots, TimedSnapshots, utils::compute_l2_snapshots},
+    listeners::order_book::{L2Requests, L2Snapshots, TimedSnapshots, utils::compute_requested_l2_snapshots},
     order_book::{
         Coin, InnerOrder, Oid,
         multi_book::{OrderBooks, Snapshots},
@@ -51,12 +51,16 @@ impl OrderBookState {
     }
 
     // (time, snapshot)
-    pub(super) fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
+    pub(super) fn l2_snapshots(
+        &mut self,
+        prevent_future_snaps: bool,
+        requested: &L2Requests,
+    ) -> Option<(u64, L2Snapshots)> {
         if self.snapped && prevent_future_snaps {
             None
         } else {
             self.snapped = prevent_future_snaps || self.snapped;
-            Some((self.time, compute_l2_snapshots(&self.order_book)))
+            Some((self.time, compute_requested_l2_snapshots(&self.order_book, requested)))
         }
     }
 

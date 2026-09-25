@@ -10,6 +10,7 @@ use crate::{
         L4Order,
         inner::{InnerL4Order, InnerLevel},
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        subscription::Subscription,
     },
 };
 use alloy::primitives::Address;
@@ -63,7 +64,7 @@ pub(crate) struct OrderBookListener {
     latest_trace: Option<Trace>,
     pub(crate) metrics: Arc<Metrics>,
     internal_message_tx: Sender<Arc<InternalMessage>>,
-    pub(crate) l2_subscriptions: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) l2_subscriptions: Arc<std::sync::Mutex<HashMap<Subscription, usize>>>,
 }
 impl OrderBookListener {
     pub(crate) fn new(tx: Sender<Arc<InternalMessage>>, config: ServerConfig) -> Self {
@@ -91,7 +92,7 @@ impl OrderBookListener {
             latest_trace: None,
             metrics: Arc::new(Metrics::default()),
             internal_message_tx: tx,
-            l2_subscriptions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            l2_subscriptions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
     pub(crate) fn is_ready(&self) -> bool {
@@ -135,8 +136,9 @@ impl OrderBookListener {
     pub(crate) fn compute_snapshot(&self) -> Option<TimedSnapshots> {
         if self.is_ready() { self.state.as_ref().map(OrderBookState::compute_snapshot) } else { None }
     }
-    pub(crate) fn current_l2(&mut self) -> Option<(u64, L2Snapshots)> {
-        if self.is_ready() { self.state.as_mut().and_then(|s| s.l2_snapshots(false)) } else { None }
+    pub(crate) fn current_l2(&mut self, subscription: &Subscription) -> Option<(u64, L2Snapshots)> {
+        let requested = l2_requests(std::iter::once(subscription));
+        if self.is_ready() { self.state.as_mut().and_then(|s| s.l2_snapshots(false, &requested)) } else { None }
     }
     fn selected_snapshot(&self, snapshot: Snapshots<InnerL4Order>) -> Snapshots<InnerL4Order> {
         Snapshots::new(snapshot.value().into_iter().filter(|(c, _)| self.config.includes(&c.value())).collect())
@@ -189,11 +191,16 @@ impl OrderBookListener {
         self.ingest_observed(source, line, Instant::now(), unix_us())
     }
     pub(crate) fn diagnostics(&self) -> serde_json::Value {
+        let requested = {
+            let demand = self.l2_subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+            l2_requests(demand.keys())
+        };
         serde_json::json!({"status":self.status,"server":crate::telemetry::version(),
             "config":{"poll_interval_ms":self.config.poll_interval.as_millis(),
                 "stale_after_ms":self.config.stale_after.as_millis(),
                 "stream_with_block_info":self.config.stream_with_block_info,
                 "integrity_interval_secs":self.config.integrity_interval.as_secs()},
+            "l2_demand":{"markets":requested.len(),"variants":requested.values().map(HashSet::len).sum::<usize>()},
             "backlog":{"order_blocks":self.orders.len(),"diff_blocks":self.diffs.len(),
                 "retained_input_bytes":self.retained_input_bytes(),
                 "budget_accounting_counter_bytes":self.buffered_bytes,
@@ -351,9 +358,13 @@ impl OrderBookListener {
                 });
             }
         }
-        if self.is_ready() && self.l2_subscriptions.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        let requested = {
+            let demand = self.l2_subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+            l2_requests(demand.keys())
+        };
+        if self.is_ready() && !requested.is_empty() {
             let l2_start = Instant::now();
-            if let Some((time, l2_snapshots)) = self.state.as_mut().and_then(|s| s.l2_snapshots(true)) {
+            if let Some((time, l2_snapshots)) = self.state.as_mut().and_then(|s| s.l2_snapshots(true, &requested)) {
                 self.metrics.elapsed("l2_aggregate_us", l2_start);
                 let trace = self.latest_trace.map(Trace::publish);
                 if let Some(t) = trace {
@@ -627,10 +638,21 @@ pub(crate) enum InternalMessage {
         trace: Option<Trace>,
     },
 }
-#[derive(Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
+}
+
+pub(super) type L2Requests = HashMap<Coin, HashSet<L2SnapshotParams>>;
+fn l2_requests<'a>(subscriptions: impl Iterator<Item = &'a Subscription> + 'a) -> L2Requests {
+    let mut requested = L2Requests::new();
+    for sub in subscriptions {
+        if let Subscription::L2Book { coin, n_sig_figs, mantissa, .. } = sub {
+            requested.entry(Coin::new(coin)).or_default().insert(L2SnapshotParams::new(*n_sig_figs, *mantissa));
+        }
+    }
+    requested
 }
 
 #[cfg(test)]
@@ -776,7 +798,15 @@ mod tests {
         let err = book.ingest(1, &line.to_string()).unwrap_err();
         book.recover(err, true);
         assert_eq!(book.status.state, Health::Stale);
-        assert!(book.current_l2().is_none());
+        assert!(
+            book.current_l2(&Subscription::L2Book {
+                coin: "BTC".into(),
+                n_sig_figs: None,
+                mantissa: None,
+                n_levels: None
+            })
+            .is_none()
+        );
     }
     #[test]
     fn replay_ignores_blocks_at_or_before_snapshot() {

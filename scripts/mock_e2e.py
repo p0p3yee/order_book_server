@@ -171,6 +171,32 @@ def main():
                 ws.send({'method':'post','id':1,'request':{'type':'info','payload':{'type':'exchangeStatus'}}})
                 assert 'not implemented' in ws.until('error')['data']
                 ws.until('l2Book')  # unsupported methods must not disconnect the market-data client
+                assert endpoint('diagnostics')['l2_demand'] == {'markets':1,'variants':1}
+                second = WS(port)
+                try:
+                    second.send({'method':'subscribe','subscription':{'type':'l2Book','coin':'BTC'}})
+                    second.until('subscriptionResponse'); second.until('l2Book')
+                    rounded = {'type':'l2Book','coin':'BTC','nSigFigs':5,'mantissa':2,'nLevels':5}
+                    ws.send({'method':'subscribe','subscription':rounded})
+                    ws.until('subscriptionResponse'); ws.until('l2Book')
+                    def wait_variants(n):
+                        end = time.monotonic()+3
+                        while time.monotonic()<end:
+                            if endpoint('diagnostics')['l2_demand']['variants']==n:return
+                            time.sleep(.02)
+                        raise AssertionError('subscription demand did not update')
+                    wait_variants(2)
+                    ws.send({'method':'unsubscribe','subscription':{'type':'l2Book','coin':'BTC'}})
+                    ws.until('subscriptionResponse')
+                    ws.send({'method':'unsubscribe','subscription':rounded})
+                    ws.until('subscriptionResponse')
+                    wait_variants(1)
+                    second.until('l2Book') # first client's unsubscribe must preserve second client's feed
+                finally: second.close()
+                wait_variants(0)
+                ws.send({'method':'subscribe','subscription':{'type':'l2Book','coin':'BTC','nLevels':5}})
+                ws.until('subscriptionResponse'); ws.until('l2Book')
+                wait_variants(1)
                 print(f'PASS ({"stream" if streamed else "batch"}): healthy >10s without snapshots; malformed fills; missed block; L4 reset; rotation; stale stream; HTTP failure; same WebSocket/process recovery')
             except Exception:
                 print(log_path.read_text(), file=sys.stderr)
