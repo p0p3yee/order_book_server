@@ -1,0 +1,47 @@
+services:
+  websocket:
+    build: .
+    image: hyperliquid-ws:low-latency
+    init: true
+    restart: unless-stopped
+    # Linux: reach hl-node's existing loopback info listener.
+    network_mode: host
+    user: "${WS_UID:-1000}:${WS_GID:-1000}"
+    environment:
+      RUST_LOG: "${RUST_LOG:-info}"
+      RAYON_NUM_THREADS: "${RAYON_NUM_THREADS:-2}"
+      TOKIO_WORKER_THREADS: "${TOKIO_WORKER_THREADS:-2}"
+    volumes:
+      - "${HL_DATA_DIR:-/path/to/node-data}:/node-data"
+    command:
+      - --address
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --node-data-dir
+      - /node-data
+      - --snapshot-path
+      - /node-data/ws-snapshot.json
+      - --snapshot-node-path
+      - "${HL_NODE_SNAPSHOT_PATH:-/path/in/node/data/ws-snapshot.json}"
+      - --info-url
+      - http://127.0.0.1:3001/info
+      - --markets
+      - "${WS_MARKETS:-BTC,HYPE,AERO,xyz:NVDA,xyz:DRAM}"
+      - --websocket-compression-level
+      - "0"
+      - --integrity-interval-secs
+      - "${WS_INTEGRITY_INTERVAL_SECS:-0}"
+      - --poll-interval-ms
+      - "${WS_POLL_INTERVAL_MS:-5}"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 180s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"

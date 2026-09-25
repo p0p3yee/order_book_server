@@ -24,25 +24,24 @@ The `l4book` subscription first sends a snapshot of the entire book and then for
 }
 ```
 
-## Setup
+## Modified local implementation
 
-1. Run a non-validating node (from [`hyperliquid-dex/node`](https://github.com/hyperliquid-dex/node)). Requires batching by block. Requires recording fills, order statuses, and raw book diffs. Requires handling info requests. 
+This branch is pinned to upstream commit `8b4f237904f683aca2dba21a07d87e831ead2a97`.
+It adds controlled in-process recovery, safe trade reconstruction, fixed market filtering,
+configurable data/snapshot paths, optional integrity checkpoints, and guarded streamed
+block-info support. Full snapshots are requested at startup/recovery; scheduled full
+snapshots are **disabled by default**.
 
-2. Then run this local server:
+See [DEPLOYMENT.md](DEPLOYMENT.md) for architecture, build/test commands, Docker/Compose,
+node flags, LAN API behavior, migration, actual-server checks, and remaining limitations.
+Streamed mode remains experimental until the node's output continuity is verified.
 
 ```bash
-cargo run --release --bin websocket_server -- --address 0.0.0.0 --port 8000
+cargo fmt --check
+cargo test --locked
+cargo build --locked --release --bin websocket_server
+python3 scripts/mock_e2e.py
+python3 scripts/mock_e2e.py --stream
 ```
 
-If this local server does not detect the node writing down any new events, it will automatically exit after some amount of time (currently set to 5 seconds).
-In addition, the local server periodically fetches order book snapshots from the node, and compares to its own internal state. If a difference is detected, it will exit.
-
-If you want logging, prepend the command with `RUST_LOG=info`.
-
-The WebSocket server comes with compression built-in. The compression ratio can be tuned using the `--websocket-compression-level` flag.
-
-## Caveats
-
-- This server does **not** show untriggered trigger orders.
-- It currently **does not** support spot order books.
-- The current implementation batches node outputs by block, making the order book a few milliseconds slower than a streaming implementation.
+The mock tests are entirely local and never contact your Hyperliquid node.
