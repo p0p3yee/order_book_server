@@ -118,3 +118,21 @@ stale input, startup replay and actual gaps remain gated. Consumers must still
 apply their own event-age limits; the service's default stale threshold is five
 seconds. Stale contiguous book replay is similarly applied while book delivery is
 gated, avoiding repeated snapshots solely because intermediate records are old.
+
+## History lookup readiness is stricter than publication readiness
+
+`historyCurrent` is false during every input read pass and any known backlog,
+stale input, gap or persistence failure. It becomes true only after both readers
+reach their known tips with fresh timestamps and equal heights. Publication grace
+never authorizes an `orderStatus` answer. Both in-memory and SQLite lookup paths
+return `LOCAL_HISTORY_UNAVAILABLE` if history is not current, including a recheck
+after the disk read. Streamed order records require a later block in both sources
+to prove their block is complete; batch records require both sources at their block
+or later. Preserve public fallback; a publication `Ready` status alone does not
+promise that local order metadata can currently be answered.
+
+`historyCurrent` describes the reader's in-memory view, not full persistence.
+Lookups choose the newest matching order and fill across pending and retained
+records. SQLite fallback is refused whenever pending records exist, and all
+lookups are gated while the writer owns a pending commit. This prevents retention
+from exposing older database state before newer observations are committed.

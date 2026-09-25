@@ -58,6 +58,14 @@ fn reply(data: Value, gaps: u64, last_fill_seq: u64, seq: u64) -> Result<Value, 
         json!({"status":"order","order":{"order":data["order"],"status":data["status"],"statusTimestamp":data["statusTimestamp"]}}),
     )
 }
+fn complete_height(s: &State, streamed: bool) -> Option<u64> {
+    let orders = s.sources[0].height?;
+    let fills = s.sources[1].height?;
+    if orders != fills {
+        return None;
+    }
+    orders.checked_sub(u64::from(streamed))
+}
 impl WalletHub {
     pub(crate) async fn order_status(&self, payload: Value) -> Result<Value, String> {
         let user = payload["user"].as_str().ok_or("400: missing user")?.to_ascii_lowercase();
@@ -74,23 +82,31 @@ impl WalletHub {
         }
         let (epoch, seq, hot) = {
             let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if !s.ready || s.journal_error.is_some() {
-                return Err(format!("{UNAVAILABLE}wallet stream is not ready"));
+            if !s.ready || !s.history_current || s.journal_error.is_some() {
+                return Err(format!("{UNAVAILABLE}wallet history is not current (replay, backlog or stale input)"));
             }
             let hot = s
-                .events
+                .pending
                 .iter()
-                .rev()
-                .find(|e| e.user == user && e.channel == "orderUpdates" && identity_matches(&e.data["order"], &oid))
+                .chain(s.events.iter())
+                .filter(|e| e.user == user && e.channel == "orderUpdates" && identity_matches(&e.data["order"], &oid))
+                .max_by_key(|e| e.seq)
                 .cloned();
             if let Some(e) = &hot {
+                if complete_height(&s, self.streamed).is_none_or(|height| e.height > height) {
+                    return Err(format!("{UNAVAILABLE}order block is not complete in both sources"));
+                }
                 let fill = s
-                    .events
+                    .pending
                     .iter()
-                    .rev()
-                    .find(|f| f.user == user && f.channel == "userFills" && f.data["oid"] == e.data["order"]["oid"])
+                    .chain(s.events.iter())
+                    .filter(|f| f.user == user && f.channel == "userFills" && f.data["oid"] == e.data["order"]["oid"])
+                    .max_by_key(|f| f.seq)
                     .map_or(0, |f| f.seq);
                 return reply(e.data.clone(), s.gaps, fill, e.seq);
+            }
+            if !s.pending.is_empty() {
+                return Err(format!("{UNAVAILABLE}uncommitted history prevents database fallback"));
             }
             (s.epoch, s.seq, hot)
         };
@@ -104,12 +120,15 @@ impl WalletHub {
                 .map_err(|e| e.to_string())?
                 .map_err(|e| format!("{UNAVAILABLE}{e}"))?;
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !s.ready || s.epoch != epoch || s.seq != seq || s.journal_error.is_some() {
+        if !s.ready || !s.history_current || s.epoch != epoch || s.seq != seq || s.journal_error.is_some() {
             return Err(format!("{UNAVAILABLE}wallet changed during historical lookup; retry"));
         }
-        let Some((seq, data, fill)) = record else {
+        let Some((seq, data, fill, height)) = record else {
             return Err(format!("{UNAVAILABLE}no retained authoritative record for this identity"));
         };
+        if complete_height(&s, self.streamed).is_none_or(|complete| height > complete) {
+            return Err(format!("{UNAVAILABLE}historical order block is not complete in both sources"));
+        }
         reply(data, s.gaps, fill, seq)
     }
 }
@@ -130,6 +149,148 @@ mod tests {
         let mut data = record();
         data["status"] = json!("filled");
         assert!(reply(data, 1, 2, 1).is_ok());
+    }
+    #[tokio::test]
+    async fn publication_grace_never_authorizes_history_ahead_of_fills() {
+        let user = "0x0000000000000000000000000000000000000001";
+        let mut s = State::new();
+        s.set_ready(true);
+        for source in &mut s.sources {
+            source.height = Some(10);
+        }
+        s.source_height = 10;
+        s.push(user.into(), "orderUpdates", record(), "open".into());
+        assert!(s.can_publish(false, Duration::from_millis(99), true, false));
+        let hub = super::super::tests::hub(s);
+        let request = json!({"user":user,"oid":7});
+        assert_eq!(hub.status()["historyCurrent"], false);
+        assert_eq!(
+            hub.order_status(request.clone()).await.unwrap_err(),
+            format!("{UNAVAILABLE}wallet history is not current (replay, backlog or stale input)")
+        );
+        {
+            let mut s = hub.state.lock().unwrap();
+            s.push(user.into(), "userFills", json!({"oid":7}), "fill".into());
+            s.history_current = true;
+        }
+        assert!(hub.order_status(request.clone()).await.unwrap_err().contains("subsequent fill"));
+        {
+            let mut s = hub.state.lock().unwrap();
+            let mut terminal = record();
+            terminal["status"] = json!("filled");
+            s.push(user.into(), "orderUpdates", terminal, "terminal".into());
+        }
+        assert_eq!(hub.order_status(request.clone()).await.unwrap()["order"]["status"], "filled");
+        // Even an otherwise valid terminal/historical response is gated by backlog.
+        hub.state.lock().unwrap().history_current = false;
+        assert!(hub.order_status(request).await.unwrap_err().starts_with(UNAVAILABLE));
+    }
+    #[tokio::test]
+    async fn current_stream_fragments_and_misaligned_sources_cannot_answer_orders() {
+        let user = "0x0000000000000000000000000000000000000001";
+        let mut s = State::new();
+        s.set_ready(true);
+        s.history_current = true;
+        s.source_height = 10;
+        s.sources[0].height = Some(10);
+        s.sources[1].height = Some(9);
+        s.push(user.into(), "orderUpdates", record(), "open".into());
+        let mut hub = super::super::tests::hub(s);
+        let request = json!({"user":user,"oid":7});
+        assert!(hub.order_status(request.clone()).await.is_err());
+        hub.state.lock().unwrap().sources[1].height = Some(10);
+        assert!(hub.order_status(request.clone()).await.is_ok());
+        hub.streamed = true;
+        assert!(hub.order_status(request.clone()).await.is_err());
+        for source in &mut hub.state.lock().unwrap().sources {
+            source.height = Some(11);
+        }
+        assert!(hub.order_status(request.clone()).await.is_ok());
+        let root = std::env::temp_dir().join(format!(
+            "ws-order-query-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        hub.db_path = root.join("history.sqlite");
+        {
+            let mut s = hub.state.lock().unwrap();
+            let now = chrono::Utc::now().timestamp_millis();
+            s.pending[0].data["statusTimestamp"] = json!(now);
+            let mut store = storage::Store::open(&hub.db_path).unwrap();
+            store.commit(&s.pending, &Default::default(), s.seq, &[], &ServerConfig::default(), now).unwrap();
+            s.pending.clear();
+            s.events.clear(); // force the indexed historical path
+            for source in &mut s.sources {
+                source.height = Some(10);
+            }
+        }
+        assert!(hub.order_status(request.clone()).await.unwrap_err().contains("historical order block"));
+        for source in &mut hub.state.lock().unwrap().sources {
+            source.height = Some(11);
+        }
+        assert!(hub.order_status(request.clone()).await.is_ok());
+        hub.state.lock().unwrap().history_current = false;
+        assert!(hub.order_status(request).await.unwrap_err().contains("history is not current"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn evicted_uncommitted_records_never_fall_back_to_older_sqlite_state() {
+        let user = "0x0000000000000000000000000000000000000001";
+        let mut s = State::new();
+        s.set_ready(true);
+        s.history_current = true;
+        s.source_height = 10;
+        for source in &mut s.sources {
+            source.height = Some(10);
+        }
+        let mut old = record();
+        let now = chrono::Utc::now().timestamp_millis();
+        old["statusTimestamp"] = json!(now);
+        s.push(user.into(), "orderUpdates", old, "persisted-open".into());
+        let root = std::env::temp_dir().join(format!(
+            "ws-pending-query-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("history.sqlite");
+        {
+            let mut store = storage::Store::open(&path).unwrap();
+            store.commit(&s.pending, &Default::default(), s.seq, &[], &ServerConfig::default(), now).unwrap();
+        }
+        s.pending.clear();
+        s.events.clear();
+        s.push(user.into(), "userFills", json!({"oid":7}), "pending-fill".into());
+        for n in 0..=MAX_EVENTS {
+            s.push(user.into(), "userFills", json!({"oid":8}), format!("other-fill-{n}"));
+        }
+        assert!(!s.events.iter().any(|e| e.data["oid"] == 7));
+        let mut hub = super::super::tests::hub(s);
+        hub.db_path = path;
+        let request = json!({"user":user,"oid":7});
+        assert!(hub.order_status(request.clone()).await.unwrap_err().contains("uncommitted history"));
+        let committing = {
+            let mut s = hub.state.lock().unwrap();
+            s.history_current = false;
+            std::mem::take(&mut s.pending)
+        };
+        // The writer owns pending now; an empty pending vector must not expose old SQLite.
+        assert!(hub.order_status(request.clone()).await.unwrap_err().contains("history is not current"));
+        {
+            let mut s = hub.state.lock().unwrap();
+            s.pending = committing;
+            s.history_current = true;
+            let mut latest = record();
+            latest["status"] = json!("canceled");
+            s.push(user.into(), "orderUpdates", latest, "pending-cancel".into());
+            for n in 0..=MAX_EVENTS {
+                s.push(user.into(), "userFills", json!({"oid":8}), format!("more-fills-{n}"));
+            }
+            assert!(!s.events.iter().any(|e| e.channel == "orderUpdates"));
+        }
+        assert_eq!(hub.order_status(request).await.unwrap()["order"]["status"], "canceled");
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn wire_updates_exclude_internal_fields_and_keep_basic_types() {

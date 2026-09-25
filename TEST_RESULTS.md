@@ -241,3 +241,26 @@ failed once and passed on unchanged retry; it now allows the one-second sampling
 period plus the two-second HTTP work window, retaining strict partial-perp rejection.
 These synthetic tests do not establish production latency gains or remove node
 output delays. Passive deployment verification remains required.
+
+## Strict order-history gate following backlog grace
+
+The backlog-grace checkpoint must not be deployed without this correction:
+publication readiness alone could authorize an open-order answer ahead of pending
+fills. A separate `historyCurrent` gate now requires fresh, aligned source tips.
+Both hot and indexed SQLite lookups reject known backlog and incomplete streamed
+blocks. Tests cover a pending fill within 99 ms of grace, later-fill invalidation,
+observed terminal state, mismatched heights, streamed block completion, and the
+same checks through SQLite after evicting the hot record. The exact history-gate
+error is asserted so an unrelated allowlist failure cannot satisfy the regression.
+Rust tests: 71 passed, two ignored; release build passed.
+Final process checks passed: bot compatibility and wallet large-record, batch, and
+streamed modes. Book batch/stream checks passed with the unchanged book replay
+implementation in the preceding checkpoint. Formatting and privacy checks passed.
+
+The strict-history correction also covers retention before commit: lookups search
+pending plus retained records by sequence, refuse SQLite fallback with pending
+history, and gate the interval while the writer owns pending records. A real SQLite
+regression exceeds the hot-cache retention bound, verifies that an evicted pending
+fill cannot expose an older open order, verifies the commit-in-progress gate, and
+uses the newer evicted pending terminal record. Rust tests: 72 passed, two ignored;
+release build passed. Publication readiness does not imply durable history.

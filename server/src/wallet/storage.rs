@@ -441,26 +441,26 @@ mod tests {
 }
 
 /// Indexed reads preserve the most recent observed state and later-fill evidence.
-pub(super) fn order_record(path: &Path, user: &str, oid: &Value) -> crate::Result<Option<(u64, Value, u64)>> {
+pub(super) fn order_record(path: &Path, user: &str, oid: &Value) -> crate::Result<Option<(u64, Value, u64, u64)>> {
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(Duration::from_millis(200))?;
     conn.execute_batch("BEGIN")?;
     let sql = if oid.is_u64() {
-        "SELECT seq,data FROM events WHERE channel='orderUpdates' AND user=?1 AND json_extract(data,'$.order.oid')=?2 ORDER BY seq DESC LIMIT 1"
+        "SELECT seq,data,height FROM events WHERE channel='orderUpdates' AND user=?1 AND json_extract(data,'$.order.oid')=?2 ORDER BY seq DESC LIMIT 1"
     } else {
-        "SELECT seq,data FROM events WHERE channel='orderUpdates' AND user=?1 AND lower(json_extract(data,'$.order.cloid'))=?2 ORDER BY seq DESC LIMIT 1"
+        "SELECT seq,data,height FROM events WHERE channel='orderUpdates' AND user=?1 AND lower(json_extract(data,'$.order.cloid'))=?2 ORDER BY seq DESC LIMIT 1"
     };
     let identity = if let Some(n) = oid.as_u64() {
         rusqlite::types::Value::Integer(n as i64)
     } else {
         rusqlite::types::Value::Text(oid.as_str().unwrap_or("").to_ascii_lowercase())
     };
-    let row: Option<(u64, String)> =
-        conn.query_row(sql, params![user, identity], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-    let Some((seq, data)) = row else { return Ok(None) };
+    let row: Option<(u64, String, u64)> =
+        conn.query_row(sql, params![user, identity], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+    let Some((seq, data, height)) = row else { return Ok(None) };
     let data: Value = serde_json::from_str(&data)?;
     let fill:u64=conn.query_row("SELECT COALESCE(MAX(seq),0) FROM events WHERE channel='userFills' AND user=?1 AND json_extract(data,'$.oid')=?2",params![user,data["order"]["oid"].as_u64().unwrap_or(0)],|r|r.get(0))?;
-    Ok(Some((seq, data, fill)))
+    Ok(Some((seq, data, fill, height)))
 }
 
 #[cfg(test)]
@@ -495,8 +495,8 @@ mod order_lookup_tests {
         ];
         store.commit(&events, &Default::default(), 2, &[], &ServerConfig::default(), now).unwrap();
         for identity in [json!(7), json!(cloid.to_uppercase().replacen("0X", "0x", 1))] {
-            let (seq, _, fill) = order_record(&path, "u", &identity).unwrap().unwrap();
-            assert_eq!((seq, fill), (1, 2));
+            let (seq, _, fill, height) = order_record(&path, "u", &identity).unwrap().unwrap();
+            assert_eq!((seq, fill, height), (1, 2, 1));
         }
         assert!(order_record(&path, "another-wallet", &json!(7)).unwrap().is_none());
         assert!(order_record(&path, "u", &json!(8)).unwrap().is_none());

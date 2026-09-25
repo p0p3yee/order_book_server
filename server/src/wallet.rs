@@ -110,6 +110,7 @@ struct State {
     bytes: usize,
     sources: [Source; 2],
     ready: bool,
+    history_current: bool,
     reason: String,
     journal_error: Option<String>,
     gaps: u64,
@@ -138,6 +139,7 @@ impl State {
             bytes: 0,
             sources: [Source::default(), Source::default()],
             ready: false,
+            history_current: false,
             reason: "startup: loading retained history and resuming input cursors".into(),
             journal_error: None,
             gaps: 0,
@@ -166,6 +168,9 @@ impl State {
             return false;
         }
         self.ready = ready;
+        if !ready {
+            self.history_current = false;
+        }
         self.replaying = !ready;
         self.reason = if ready {
             "retained source replay caught up; live local streams ready"
@@ -179,6 +184,7 @@ impl State {
         self.epoch += 1;
         self.gaps += 1;
         self.ready = false;
+        self.history_current = false;
         self.sources = [Source::default(), Source::default()];
         self.reason = reason;
     }
@@ -217,7 +223,7 @@ impl State {
         json!({"source":"localNode","state":if self.ready {"Ready"} else {"Stale"},
             "generation":self.epoch,"reason":self.reason,"gaps":self.gaps,"sessionStartedAt":self.session_started_at,
             "historyComplete":false,"historyScope":"retained local observations; see localWalletHistory for disk history and gaps",
-            "coverageStartTime":self.coverage_start,"replaying":self.replaying,
+            "coverageStartTime":self.coverage_start,"replaying":self.replaying,"historyCurrent":self.history_current,
             "oldestRetainedSequence":self.events.front().map(|e|e.seq),"latestSequence":self.seq,
             "retainedEvents":self.events.len(),"retainedBytes":self.bytes,"journalError":self.journal_error,
             "orderHeight":self.sources[0].height,"fillHeight":self.sources[1].height,
@@ -601,6 +607,9 @@ fn run_worker(
         if running.upgrade().is_none() {
             break;
         }
+        // Publication may tolerate brief backlog, but history-derived answers
+        // must never use an open record ahead of the fill reader in this pass.
+        state.lock().unwrap_or_else(|e| e.into_inner()).history_current = false;
         if !persistence_failed {
             for i in 0..2 {
                 if readers[i].is_none() && last_discovery.elapsed() >= Duration::from_secs(1) {
@@ -708,7 +717,12 @@ fn run_worker(
         if s.set_ready(ready) {
             signal.send_modify(|n| *n += 1);
         }
+        s.history_current =
+            ready && caught_up && s.sources[0].height.is_some() && s.sources[0].height == s.sources[1].height;
         if last_commit.elapsed() >= Duration::from_secs(1) || (!persistence_failed && s.pending.len() >= 256) {
+            // pending leaves State while SQLite commits. Do not allow a lookup
+            // to mistake that temporary absence for fully persisted history.
+            s.history_current = false;
             let pending = std::mem::take(&mut s.pending);
             let seq = s.seq;
             let coverage = s.coverage_start;
@@ -737,6 +751,7 @@ fn run_worker(
                         s.epoch += 1;
                     }
                     s.ready = false;
+                    s.history_current = false;
                     s.reason = "wallet persistence blocked; source cursors retained for retry".into();
                     persistence_failed = true;
                 }
@@ -923,7 +938,7 @@ mod tests {
         json!({"coin":"xyz:NVDA","side":"B","px":"100","sz":"1","time":123,"startPosition":"0","dir":"Open Long",
             "closedPnl":"0","hash":"0xabc","oid":1,"crossed":true,"fee":"0.1","tid":7,"feeToken":"USDC","builderFee":"0.01","deployerFee":"0.02"})
     }
-    fn hub(state: State) -> WalletHub {
+    pub(super) fn hub(state: State) -> WalletHub {
         let (signal, _) = watch::channel(0);
         WalletHub {
             state: Arc::new(Mutex::new(state)),
