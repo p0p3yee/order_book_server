@@ -27,7 +27,11 @@ container's environment. See LOCAL_WALLETS.md and scripts/deploy_local_wallets.s
 ## Consumer contract
 
 Use `(sessionStartedAt, generation)` for the producer's stream epoch; the generation
-counter alone can repeat after a process restart. Keep the bot connection generation
+counter alone can repeat after a process restart. Temporary replay backlog or stale
+upstream input pauses publication with `Stale` without changing the continuity
+epoch. Consumers must invalidate pending proofs on `Stale` even if the generation
+is unchanged. Once `Ready`, retained incremental events resume from the existing
+cursor; retention overflow or a real gap still requires a reset. Keep the bot connection generation
 separately. Ignore results from previous connections/subscription tokens.
 
 An initial `resetRequired:true` is a per-subscription baseline boundary. Collect the

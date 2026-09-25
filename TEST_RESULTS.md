@@ -197,3 +197,23 @@ The large-record process regression passes after the fix, as do the batch and
 streamed wallet process tests and the three-wallet bot compatibility process test.
 `cargo fmt --check` and `git diff --check` pass. No production latency benefit is
 claimed until the corrected image is manually deployed and observed.
+
+## Separate wallet readiness from continuity
+
+A passive 180-second mainnet capture after 53f1ccb recorded 29 temporary readiness
+cycles with unchanged gaps and no persistence errors. The Ready-to-Stale branch
+still advanced the continuity epoch for genuine but recoverable read backlog.
+
+Temporary backlog/upstream-age pauses now gate publication without changing the
+epoch. Retained delivery cursors resume incrementally when Ready. Actual gaps,
+retention-overflow reset handling, and conservative persistence-error invalidation
+remain. Consumers must invalidate pending proofs on Stale, independently of epoch.
+
+Validation: 67 Rust tests passed, two ignored; release build, formatting and diff
+checks passed. Large-record, batch wallet, streamed wallet, and bot compatibility
+process tests passed. The unit regression verifies withholding a pending fill
+while Stale, incremental delivery after Ready, and reset on an actual gap. Both
+wallet process modes exercise stale upstream recovery on the same connection
+without an invented generation/gap. The large-record test now waits for independent
+wallet startup rather than incorrectly equating book health with wallet readiness.
+Production pause frequency and event delivery still require a post-deploy capture.

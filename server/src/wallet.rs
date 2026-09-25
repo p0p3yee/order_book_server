@@ -149,6 +149,23 @@ impl State {
             aggregation_floor: HashMap::new(),
         }
     }
+    // Readiness gates publication; epoch identifies continuity, not scheduling.
+    // Catching up retained input or waiting for fresh upstream data preserves
+    // cursors. Actual gaps and persistence failures invalidate continuity below.
+    fn set_ready(&mut self, ready: bool) -> bool {
+        if ready == self.ready && !(ready && self.replaying) {
+            return false;
+        }
+        self.ready = ready;
+        self.replaying = !ready;
+        self.reason = if ready {
+            "retained source replay caught up; live local streams ready"
+        } else {
+            "wallet replay or stale upstream; publishing paused"
+        }
+        .into();
+        true
+    }
     fn gap(&mut self, reason: String) {
         self.epoch += 1;
         self.gaps += 1;
@@ -670,18 +687,7 @@ fn run_worker(
                     chrono::Utc::now().timestamp_millis().saturating_sub(t) <= config.stale_after.as_millis() as i64
                 })
             });
-        if ready != s.ready || (ready && s.replaying) {
-            if s.ready && !ready {
-                s.epoch += 1;
-            }
-            s.ready = ready;
-            s.replaying = !ready;
-            s.reason = if ready {
-                "retained source replay caught up; live local streams ready"
-            } else {
-                "wallet replay or stale upstream; publishing paused"
-            }
-            .into();
+        if s.set_ready(ready) {
             signal.send_modify(|n| *n += 1);
         }
         if last_commit.elapsed() >= Duration::from_secs(1) || (!persistence_failed && s.pending.len() >= 256) {
@@ -999,6 +1005,34 @@ mod tests {
         let mut bad = event;
         bad["order"].as_object_mut().unwrap().remove("origSz");
         assert!(decode(0, &batch(1, json!([bad])), &allowed).is_err());
+    }
+    #[test]
+    fn temporary_pause_preserves_continuity_and_replays_undelivered_events() {
+        let mut s = State::new();
+        assert!(s.set_ready(true));
+        let hub = hub(s);
+        let sub = WalletSubscription::UserFills { user: USER.into(), aggregate_by_time: false };
+        let cursor = hub.read(&sub, None).2;
+        {
+            let mut s = hub.state.lock().unwrap();
+            assert!(s.set_ready(false));
+            assert!(!s.set_ready(false));
+            s.push(USER.into(), "userFills", fill(), "pending".into());
+        }
+        let (status, messages, _, reset) = hub.read(&sub, Some(cursor));
+        assert_eq!(status["state"], "Stale");
+        assert!(!reset);
+        assert!(messages.is_empty());
+        assert!(hub.state.lock().unwrap().set_ready(true));
+        let (status, messages, next, reset) = hub.read(&sub, Some(cursor));
+        assert_eq!(status["generation"], cursor.0);
+        assert_eq!(status["gaps"], 0);
+        assert!(!reset);
+        assert_eq!(messages[0]["data"]["isSnapshot"], false);
+        assert_eq!(messages[0]["data"]["fills"], json!([fill()]));
+        assert!(next.1 > cursor.1);
+        hub.state.lock().unwrap().gap("actual missing input".into());
+        assert!(hub.read(&sub, Some(next)).3);
     }
     #[test]
     fn retention_overflow_and_epoch_changes_require_reset() {

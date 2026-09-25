@@ -100,6 +100,14 @@ def main():
             if large_records:
                 # A single valid mainnet record can exhaust the poll byte budget.
                 # Reaching EOF on that record must not reset a healthy wallet epoch.
+                # Book health can become Ready before the independent wallet worker.
+                deadline = time.monotonic() + 3
+                while True:
+                    with urllib.request.urlopen(f'http://127.0.0.1:{port}/diagnostics', timeout=2) as r:
+                        initial = json.load(r)['wallet']
+                    if initial['state'] == 'Ready': break
+                    assert time.monotonic() < deadline, 'wallet startup timeout'
+                    time.sleep(.02)
                 samples = []
                 deadline = time.monotonic() + 3
                 while time.monotonic() < deadline:
@@ -108,7 +116,7 @@ def main():
                     time.sleep(.02)
                 generations = {s['generation'] for s in samples}
                 assert len(generations) == 1, f'large-record epoch churn: {sorted(generations)}'
-                assert all(s['state'] == 'Ready' for s in samples), samples
+                assert all(s['state'] == 'Ready' for s in samples), [(s['state'], s['reason']) for s in samples if s['state'] != 'Ready']
                 assert len({s['gaps'] for s in samples}) == 1, samples
                 assert samples[-1]['orderHeight'] > samples[0]['orderHeight'], samples
                 assert samples[-1]['fillHeight'] > samples[0]['fillHeight'], samples
@@ -177,12 +185,17 @@ def main():
                 with lock: state['skip'] = True
                 a.until('walletStatus', predicate=lambda m: m['data'].get('resetRequired') is True and m['data'].get('generation', 0) > 0)
             a.until('l2Book')
-            # Stop output: explicit gap on same WebSocket, followed by new snapshots.
+            # A pause gates publishing but does not invent a continuity gap/reset.
+            with urllib.request.urlopen(f'http://127.0.0.1:{port}/diagnostics') as r:
+                before_pause = json.load(r)['wallet']
             with lock: state['pause'] = True
             a.until('walletStatus', predicate=lambda m: m['data']['state'] == 'Stale')
             time.sleep(.1)
             with lock: state['pause'] = False
-            a.until('walletStatus', predicate=lambda m: m['data']['state'] == 'Ready' and m['data'].get('resetRequired') is True)
+            recovered = a.until('walletStatus', predicate=lambda m: m['data']['state'] == 'Ready' and m['data'].get('subscription', {}).get('type') == 'userFills')
+            assert recovered['data']['generation'] == before_pause['generation'], recovered
+            assert recovered['data']['resetRequired'] is False, recovered
+            assert recovered['data']['gaps'] == before_pause['gaps'], recovered
             a.until('l2Book')
             agg = WS(port); clients.append(agg); sub(agg, 'userFills', aggregateByTime=True)
             assert agg.until('userFills')['data']['fills'][0]['sz'] == '1'
