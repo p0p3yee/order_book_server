@@ -36,3 +36,17 @@ production reader by the new tail tests and actual-process rotation test.
 These tests establish the exercised behavior, not mainnet book parity or a measured
 latency reduction. Stream fixtures include contiguous empty-block envelopes; the real
 node's streamed empty-block behavior remains a deployment qualification requirement.
+
+## Decimal compatibility follow-up
+
+The first real-node startup report failed with `invalid fixed point decimal` after
+snapshot generation and JSON reading succeeded. The original diagnostic did not expose
+the value, so its precise format/market cannot be determined from that report.
+
+The follow-up supports scientific notation using exact integer conversion, filters
+excluded snapshot markets before fixed-point conversion, and adds coin/order/field/value
+context to conversion errors. Regression tests cover exact scientific prices/sizes,
+exponent limits, overflow, rejection of lossy precision, and exclusion of a spot market
+with an unrepresentable price. `cargo test --locked`: 38 passed. Formatting and the
+release build passed. Both batch and streamed local process tests also passed again.
+Actual-node confirmation remains pending.

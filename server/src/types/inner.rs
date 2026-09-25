@@ -99,8 +99,15 @@ impl TryFrom<(Address, L4Order)> for InnerL4Order {
             ..
         } = value.1;
         let user = value.0;
-        let limit_px = Px::parse_from_str(&limit_px)?;
-        let sz = Sz::parse_from_str(&sz)?;
+        let limit_px = Px::parse_from_str(&limit_px).map_err(|err| {
+            format!(
+                "coin={coin} oid={oid} field=limitPx value={:?}: {err}",
+                limit_px.chars().take(128).collect::<String>()
+            )
+        })?;
+        let sz = Sz::parse_from_str(&sz).map_err(|err| {
+            format!("coin={coin} oid={oid} field=sz value={:?}: {err}", sz.chars().take(128).collect::<String>())
+        })?;
         Ok(Self {
             user,
             coin: Coin::new(&coin),

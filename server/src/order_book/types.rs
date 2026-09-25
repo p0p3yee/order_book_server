@@ -144,32 +144,93 @@ impl Sz {
 }
 
 fn parse_decimal(value: &str) -> Result<u64> {
-    let (whole, frac) = value.split_once('.').unwrap_or((value, ""));
-    if whole.is_empty()
+    // Accept the decimal/scientific notation accepted by the reference reader,
+    // but never round a value that the book's eight-decimal representation cannot hold.
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let mut parts = value.split(['e', 'E']);
+    let mantissa = parts.next().ok_or("missing decimal mantissa")?;
+    let exponent = parts.next().map(str::parse::<i64>).transpose()?.unwrap_or(0);
+    if parts.next().is_some() {
+        return Err("multiple decimal exponents".into());
+    }
+    let (whole, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && frac.is_empty())
         || !whole.bytes().all(|c| c.is_ascii_digit())
         || !frac.bytes().all(|c| c.is_ascii_digit())
-        || (frac.len() > 8 && frac[8..].bytes().any(|c| c != b'0'))
     {
-        return Err("invalid fixed point decimal".into());
+        return Err("invalid nonnegative decimal".into());
     }
-    let frac = &frac[..frac.len().min(8)];
-    let fraction = if frac.is_empty() { 0 } else { frac.parse::<u64>()? * 10_u64.pow(8 - frac.len() as u32) };
-    whole
-        .parse::<u64>()?
-        .checked_mul(100_000_000)
-        .and_then(|v| v.checked_add(fraction))
-        .ok_or_else(|| "decimal overflow".into())
+    let digits = format!("{whole}{frac}");
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Ok(0);
+    }
+    let shift = exponent
+        .checked_add(8)
+        .and_then(|v| v.checked_sub(frac.len() as i64))
+        .ok_or("decimal exponent out of range")?;
+    let (digits, zeros) = if shift < 0 {
+        let remove = shift.unsigned_abs();
+        if remove > digits.len() as u64 {
+            return Err("decimal is not exactly representable at eight decimal places".into());
+        }
+        let split = digits.len() - remove as usize;
+        if digits.as_bytes()[split..].iter().any(|b| *b != b'0') {
+            return Err("decimal is not exactly representable at eight decimal places".into());
+        }
+        (&digits[..split], 0)
+    } else {
+        (digits, shift as u64)
+    };
+    if digits.len() as u64 + zeros > 20 {
+        return Err("decimal overflow".into());
+    }
+    let mut result = digits.parse::<u64>()?;
+    for _ in 0..zeros {
+        result = result.checked_mul(10).ok_or("decimal overflow")?;
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
 mod decimal_tests {
     use super::*;
     #[test]
+    fn scientific_notation_is_exact() {
+        for (input, expected) in [
+            ("1e-8", "0.00000001"),
+            ("1.234e2", "123.4"),
+            ("1E+3", "1000"),
+            ("+0.50", "0.5"),
+            (".5", "0.5"),
+            ("10e-9", "0.00000001"),
+            ("0e-100", "0"),
+            ("184467440737.09551615", "184467440737.09551615"),
+        ] {
+            assert_eq!(Px::parse_from_str(input).unwrap().to_str(), expected);
+            assert_eq!(Sz::parse_from_str(input).unwrap().to_str(), expected);
+        }
+        for input in [
+            "1e-9",
+            "1.234567891",
+            "1e100",
+            "1e-100",
+            "1e",
+            "1e2e3",
+            "-1e-8",
+            "184467440737.09551616",
+            "1e9223372036854775807",
+            "1e-9223372036854775808",
+        ] {
+            assert!(Px::parse_from_str(input).is_err(), "accepted {input}");
+        }
+    }
+    #[test]
     fn exact_prices_and_invalid_numbers() {
         for v in ["100.00000001", "99999999.99999999", "0.00000001"] {
             assert_eq!(Px::parse_from_str(v).unwrap().to_str(), v);
         }
-        for v in ["NaN", "inf", "-1", "1e3", "0.000000001", "99999999999999999999999"] {
+        for v in ["NaN", "inf", "-1", "0.000000001", "99999999999999999999999"] {
             assert!(Px::parse_from_str(v).is_err());
         }
     }

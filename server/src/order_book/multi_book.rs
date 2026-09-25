@@ -80,7 +80,10 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
     }
 }
 
-pub(crate) fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
+pub(crate) fn load_snapshots_from_str_filtered<O, R>(
+    str: &str,
+    includes: impl Fn(&str) -> bool,
+) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
     R: Serialize + for<'a> Deserialize<'a>,
@@ -92,6 +95,7 @@ where
         Snapshots::new(
             snapshot
                 .into_iter()
+                .filter(|(coin, _)| includes(coin))
                 .map(|(coin, [bids, asks])| {
                     let bids: Vec<O> = bids.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
                     let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
@@ -100,6 +104,15 @@ where
                 .collect::<Result<HashMap<Coin, Snapshot<O>>>>()?,
         ),
     ))
+}
+
+#[cfg(test)]
+pub(crate) fn load_snapshots_from_str<O, R>(json: &str) -> Result<(u64, Snapshots<O>)>
+where
+    O: TryFrom<R, Error = Error>,
+    R: Serialize + for<'a> Deserialize<'a>,
+{
+    load_snapshots_from_str_filtered(json, |_| true)
 }
 
 #[cfg(test)]
@@ -283,6 +296,34 @@ mod tests {
         ]
     ]
 ]"#;
+
+    #[test]
+    fn excluded_markets_are_filtered_before_decimal_conversion() {
+        let mut input: serde_json::Value = serde_json::from_str(SNAPSHOT_JSON).unwrap();
+        input[1][0][1][0][0][1]["limitPx"] = serde_json::json!("1e-12");
+        let json = input.to_string();
+        let (_, books) =
+            super::load_snapshots_from_str_filtered::<InnerL4Order, (Address, L4Order)>(&json, |coin| coin == "BTC")
+                .unwrap();
+        assert!(books.as_ref().is_empty());
+        let error = match super::load_snapshots_from_str_filtered::<InnerL4Order, (Address, L4Order)>(&json, |_| true) {
+            Ok(_) => panic!("unrepresentable selected price was accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(error.contains("coin=@1"));
+        assert!(error.contains("field=limitPx"));
+        assert!(error.contains("1e-12"));
+    }
+    #[test]
+    fn snapshot_accepts_exact_scientific_prices_and_sizes() {
+        let mut input: serde_json::Value = serde_json::from_str(SNAPSHOT_JSON).unwrap();
+        input[1][0][1][0][0][1]["limitPx"] = serde_json::json!("3.0444e1");
+        input[1][0][1][0][0][1]["sz"] = serde_json::json!("1e2");
+        let (_, books) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&input.to_string()).unwrap();
+        let order = &books.as_ref()[&Coin::new("@1")].as_ref()[0][0];
+        assert_eq!(order.limit_px.to_str(), "30.444");
+        assert_eq!(order.sz.to_str(), "100");
+    }
 
     #[tokio::test]
     async fn test_deserialization_from_json() -> Result<()> {

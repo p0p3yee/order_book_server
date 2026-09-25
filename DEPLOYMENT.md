@@ -34,7 +34,8 @@ order existence, duplicate inserts, insert-before anchors, new-order status/diff
 price agreement, existing-order price, update `origSz`, and an uncrossed final book.
 Snapshot comparison checks list lengths as well as each order; an equal prefix no
 longer hides missing orders. Decimal input/output uses exact eight-decimal fixed
-point conversion rather than floating point. Unsupported precision is rejected.
+point conversion rather than floating point, including scientific notation when exactly
+representable. Unsupported precision is rejected with market/order/field/value context.
 The raw-diff path inserts orders without locally matching orders a second time.
 
 Fills are grouped by `(coin, tid)`. Exactly one consistent Ask/Bid pair is required;
@@ -46,7 +47,9 @@ until the next fill block, so an inactive market's last trade batch can be delay
 `--markets` filters reconstruction, replay events, and L2 computation while preserving
 all block envelopes. It is a fixed deployment allowlist, not a dynamic subscription
 filter; changing it requires a restart. An empty allowlist means all non-spot markets.
-The full input JSON is still parsed. L2 aggregation is skipped when there are no L2
+The full input JSON is still parsed, but excluded snapshot markets are filtered before
+conversion to fixed-point values. Unsupported precision in an excluded market therefore
+cannot block initialization of the selected markets. L2 aggregation is skipped when there are no L2
 subscriptions. The existing supported aggregation variants are computed for retained
 markets when L2 is needed.
 

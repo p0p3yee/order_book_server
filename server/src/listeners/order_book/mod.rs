@@ -2,7 +2,7 @@ use crate::{
     ServerConfig,
     order_book::{
         Coin, Snapshot,
-        multi_book::{Snapshots, load_snapshots_from_str},
+        multi_book::{Snapshots, load_snapshots_from_str_filtered},
     },
     prelude::*,
     types::{
@@ -438,7 +438,9 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, config: S
                 let read_path = path.clone();
                 let parsed = tokio::task::spawn_blocking(move || {
                     let json = fs::read_to_string(read_path)?;
-                    load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json)
+                    load_snapshots_from_str_filtered::<InnerL4Order, (Address, L4Order)>(&json, |coin| {
+                        config.includes(coin)
+                    })
                 })
                 .await?;
                 if let Err(err) = tokio::fs::remove_file(&path).await {
