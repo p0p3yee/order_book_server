@@ -372,3 +372,8 @@ persistence checks are unchanged; the publication grace is not increased.
 `python3 scripts/mock_wallet_e2e.py --reader-skew` (also with `--stream`) withholds
 fills, checks rejection during skew and bounded polling, then releases them and
 checks recovery without a gap or generation reset.
+
+The `gap` gate reason describes recovery from a new discontinuity in this process,
+not the cumulative persisted `gaps` count. Normal initialization with historical
+gaps is labeled `initializing`. Recovery clears the diagnostic flag when live
+publication becomes ready; it never clears the historical gap count.

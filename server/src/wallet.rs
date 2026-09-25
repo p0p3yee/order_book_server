@@ -117,6 +117,7 @@ struct State {
     reason: String,
     journal_error: Option<String>,
     gaps: u64,
+    recovering_gap: bool,
     pending: Vec<Event>,
     coverage_start: i64,
     replaying: bool,
@@ -147,6 +148,7 @@ impl State {
             reason: "startup: loading retained history and resuming input cursors".into(),
             journal_error: None,
             gaps: 0,
+            recovering_gap: false,
             pending: Vec::new(),
             coverage_start: chrono::Utc::now().timestamp_millis(),
             replaying: true,
@@ -162,6 +164,10 @@ impl State {
         self.history_current = reason == GateReason::Current;
         self.history_gate.set(reason, Instant::now());
     }
+    // The persisted gap counter describes history, not the cause of this wait.
+    fn missing_source_reason(&self) -> GateReason {
+        if self.recovering_gap { GateReason::Gap } else { GateReason::Initializing }
+    }
     fn sources_fresh(&self, stale_after: Duration) -> bool {
         let now = chrono::Utc::now().timestamp_millis();
         self.sources
@@ -172,6 +178,9 @@ impl State {
         !persistence_failed && fresh && (at_tip || (self.ready && backlog_age < Duration::from_millis(100)))
     }
     fn set_ready(&mut self, ready: bool) -> bool {
+        if ready {
+            self.recovering_gap = false;
+        }
         if ready == self.ready && !(ready && self.replaying) {
             return false;
         }
@@ -191,6 +200,7 @@ impl State {
     fn gap(&mut self, reason: String) {
         self.epoch += 1;
         self.gaps += 1;
+        self.recovering_gap = true;
         self.ready = false;
         self.set_history_gate(GateReason::Gap);
         self.sources = [Source::default(), Source::default()];
@@ -607,6 +617,7 @@ fn run_worker(
     if !gaps.is_empty() {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.gaps += gaps.len() as u64;
+        s.recovering_gap = true;
         s.reason = gaps.join("; ");
     }
     // Establish the initial EOF anchors before publishing any live record. A crash
@@ -702,7 +713,7 @@ fn run_worker(
                             // not only after the whole bounded read pass completes.
                             if !s.sources_fresh(config.stale_after) {
                                 let reason = if s.sources.iter().any(|source| source.height.is_none()) {
-                                    if s.gaps > 0 { GateReason::Gap } else { GateReason::Initializing }
+                                    s.missing_source_reason()
                                 } else {
                                     GateReason::StaleInput
                                 };
@@ -762,7 +773,7 @@ fn run_worker(
         let gate = if persistence_failed {
             GateReason::Persistence
         } else if s.sources.iter().any(|source| source.height.is_none()) {
-            if s.gaps > 0 { GateReason::Gap } else { GateReason::Initializing }
+            s.missing_source_reason()
         } else if !fresh {
             GateReason::StaleInput
         } else if !caught_up {
@@ -1101,6 +1112,23 @@ mod tests {
         let mut bad = event;
         bad["order"].as_object_mut().unwrap().remove("origSz");
         assert!(decode(0, &batch(1, json!([bad])), &allowed).is_err());
+    }
+    #[test]
+    fn historical_gaps_do_not_label_normal_initialization_as_gap_recovery() {
+        let mut s = State::new();
+        // Simulate a persisted historical gap loaded on an ordinary restart.
+        s.gaps = 1;
+        assert_eq!(s.missing_source_reason(), GateReason::Initializing);
+        s.gap("new input discontinuity".into());
+        assert_eq!(s.missing_source_reason(), GateReason::Gap);
+        assert_eq!(s.gaps, 2);
+        s.set_ready(true);
+        assert!(!s.recovering_gap);
+        assert_eq!(s.gaps, 2); // Recovery does not erase historical evidence.
+        s.set_ready(false);
+        assert_eq!(s.missing_source_reason(), GateReason::Initializing);
+        s.gap("another discontinuity".into());
+        assert_eq!(s.missing_source_reason(), GateReason::Gap);
     }
     #[test]
     fn lagging_reader_is_prioritized_with_positive_bounded_sleep() {
