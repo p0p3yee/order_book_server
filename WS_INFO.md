@@ -27,7 +27,8 @@ The envelope follows the [official WS post schema](https://hyperliquid.gitbook.i
 
 `l2Book` is answered from the validated reconstructed book, with the same market
 allowlist, rounding, and depth validation as L2 subscriptions. A non-ready book
-returns an error, not a suspect snapshot. Other allowlisted read-only requests
+returns an error, not a suspect snapshot. `orderStatus` and `localWalletHistory`
+are served by the local wallet journal. Other allowlisted read-only requests
 use the configured `--info-url` directly, without environment HTTP proxies or
 redirect following. Unsupported node queries remain errors; no public fallback
 is used. `/capabilities` lists the exact allowed request types.
@@ -50,9 +51,13 @@ remain a per-client transport constraint as before.
 
 ## Wallet subscriptions
 
-`orderUpdates`, `userFills`, and `openOrders` subscriptions are available with
+`orderUpdates`, `userFills`, `openOrders`, `allDexsClearinghouseState`, and
+`spotState` subscriptions are available with
 `--wallets` / `WS_WALLETS`. See [LOCAL_WALLETS.md](LOCAL_WALLETS.md) for bounded
-history, required walletStatus gap handling, and authoritative openOrders polling.
+history, required walletStatus gap handling, event-triggered openOrders, and
+periodic authoritative account sampling. Local `orderStatus` posts support retained
+full records by numeric OID or cloid; unavailable evidence returns a correlated
+`LOCAL_HISTORY_UNAVAILABLE` error, never an invented `unknownOid`.
 The Info adapter itself remains request/response; it does not synthesize historical
 HTTP `userFills` support that the local node lacks. No public wallet relay is used.
 
@@ -69,4 +74,5 @@ modes exercise Info success, slow responses with continued L2 delivery, HTTP 503
 timeout, invalid JSON, oversized responses, per-client overload, and local L2 Info.
 Unconfigured wallets return explicit allowlist errors without disconnecting.
 The separate `mock_wallet_e2e.py` tests wallet delivery and recovery in both file
-modes. These mocks do not substitute for verification on the actual node.
+modes. `mock_bot_compat_e2e.py` covers three wallets across eleven DEXes, account
+provenance and local order lookups. These mocks do not substitute for verification on the actual node.

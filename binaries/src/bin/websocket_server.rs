@@ -38,6 +38,8 @@ struct Args {
     wallet_poll_interval_ms: u64,
     #[arg(long, env = "WS_WALLET_EVENT_INTERVAL_MS", default_value_t = 100)]
     wallet_event_interval_ms: u64,
+    #[arg(long, env = "WS_WALLET_ACCOUNT_INTERVAL_MS", default_value_t = 1000)]
+    wallet_account_interval_ms: u64,
     #[arg(long, env = "WS_WALLET_HISTORY_EVENTS", default_value_t = 100000)]
     wallet_history_events: usize,
     #[arg(long, env = "WS_WALLET_HISTORY_DAYS", default_value_t = 7)]
@@ -105,6 +107,7 @@ async fn main() -> Result<()> {
     config.wallet_journal_path = args.wallet_journal_path;
     config.wallet_poll_interval = std::time::Duration::from_millis(args.wallet_poll_interval_ms);
     config.wallet_event_interval = std::time::Duration::from_millis(args.wallet_event_interval_ms);
+    config.wallet_account_interval = std::time::Duration::from_millis(args.wallet_account_interval_ms);
     config.wallet_history_events = args.wallet_history_events;
     config.wallet_history_days = args.wallet_history_days;
     config.poll_interval = std::time::Duration::from_millis(args.poll_interval_ms);

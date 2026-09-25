@@ -16,6 +16,7 @@ pub struct ServerConfig {
     pub wallet_journal_path: Option<PathBuf>,
     pub wallet_poll_interval: Duration,
     pub wallet_event_interval: Duration,
+    pub wallet_account_interval: Duration,
     pub wallet_history_events: usize,
     pub wallet_history_days: u32,
     pub stream_with_block_info: bool,
@@ -44,6 +45,7 @@ impl Default for ServerConfig {
             wallet_journal_path: None,
             wallet_poll_interval: Duration::from_secs(30),
             wallet_event_interval: Duration::from_millis(100),
+            wallet_account_interval: Duration::from_secs(1),
             wallet_history_events: 100_000,
             wallet_history_days: 7,
             stream_with_block_info: false,
@@ -68,6 +70,8 @@ impl ServerConfig {
             return Err("wallet polling interval must be at least 250 ms".into());
         }
         if self.wallet_event_interval < Duration::from_millis(10)
+            || self.wallet_account_interval < Duration::from_millis(250)
+            || self.wallet_account_interval > Duration::from_secs(5)
             || self.wallet_history_events < 2000
             || self.wallet_history_events > 1_000_000
             || self.wallet_history_days == 0

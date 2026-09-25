@@ -1,6 +1,7 @@
 # Fully local wallet streams
 
-This service can expose `userFills`, `orderUpdates`, and `openOrders` through the
+This service exposes `userFills`, `orderUpdates`, `openOrders`,
+`allDexsClearinghouseState`, `spotState`, and local `orderStatus` Info posts through the
 existing `/ws` endpoint. It uses only configured node files and the configured
 local HTTP Info endpoint. No public API fallback, private key, node binary change,
 or replay from genesis is required. Wallet ingestion is disabled until an explicit
@@ -36,6 +37,7 @@ Optional settings:
 |---|---|---|
 | `--wallet-journal-path` | `WS_WALLET_JOURNAL_PATH` | `NODE_DATA_DIR/ws-wallet-journal.sqlite` (legacy `.json` path migrates automatically) |
 | `--wallet-poll-interval-ms` | `WS_WALLET_POLL_INTERVAL_MS` | 30000 ms reconciliation; minimum 250 ms |
+| `--wallet-account-interval-ms` | `WS_WALLET_ACCOUNT_INTERVAL_MS` | 1000 ms periodic account sampling; range 250–5000 ms |
 | `--wallet-event-interval-ms` | `WS_WALLET_EVENT_INTERVAL_MS` | 100 ms minimum interval between event-triggered queries |
 | `--wallet-history-events` | `WS_WALLET_HISTORY_EVENTS` | 100000 combined disk events; range 2000–1000000 |
 | `--wallet-history-days` | `WS_WALLET_HISTORY_DAYS` | 7 days; range 1–3650 |
@@ -76,12 +78,86 @@ Unsubscribe with the same subscription and `method:"unsubscribe"`.
   open/cancel transitions can be absent; use `orderUpdates` for those. Polls are
   shared per wallet/DEX across clients, single-flight, with bounded HTTP size,
   concurrency and timeouts. No older file events are merged onto a newer HTTP
-  result without a common authoritative block-height boundary.
+  result without a common authoritative block-height boundary. Emitted snapshots
+  have a walletStatus companion with the original host query timestamps; a cached
+  delivery does not renew sample time. Cache reuse on a new request is capped at
+  five seconds.
 
 Wallet events include all markets (including spot and HIP-3) for allowed wallets,
 independent of `--markets`, which continues to control reconstructed books/trades.
-Eight wallet subscriptions per connection and 32 distinct openOrders wallet/DEX
+128 wallet subscriptions per connection and 256 distinct openOrders wallet/DEX
 cache keys per process are supported. The cache-key cap lasts until process restart.
+
+## Account snapshots and order metadata (wallet contract version 2)
+
+```json
+{"method":"subscribe","subscription":{"type":"allDexsClearinghouseState","user":"0xYOUR_ACCOUNT"}}
+{"method":"subscribe","subscription":{"type":"spotState","user":"0xYOUR_ACCOUNT"}}
+{"method":"post","id":71,"request":{"type":"info","payload":{"type":"orderStatus","user":"0xYOUR_ACCOUNT","oid":123456789}}}
+```
+
+`allDexsClearinghouseState` returns `{user,clearinghouseStates:[[dex,state],...]}`.
+The native DEX is `""`; the complete DEX catalog comes from local `perpDexs`, cached
+for 60 seconds. Each venue is sampled through local `clearinghouseState`. One failed,
+stale, or malformed venue suppresses the **whole** sample. The assembled response is
+bounded to 2 MiB/64 venues. Financial strings and integer timestamps are unchanged;
+empty positions mean an empty complete venue, never a fabricated missing venue.
+
+`spotState` returns `{user,spotState:{balances:[...]}}` from the full local
+`spotClearinghouseState` result, without filtering tokens or inventing balances.
+Its acknowledgement includes `ignorePortfolioMargin:false`, matching the observed
+public acknowledgement when omitted. `true` is explicitly unsupported because the
+local Info semantics are not documented; it is not silently ignored.
+
+Account sampling is shared per wallet/subscription, single-flight, with at most four
+concurrent account HTTP requests process-wide (inside the existing 16-request Info
+limit). Only active subscriptions initiate sampling. One-second periodic sampling
+covers transfers, funding and liquidation even without fill/order events. It is
+separate from the event-triggered openOrders cache. Additional clients share samples.
+For three wallets/11 venues, budgeting approximately 39 account queries/second plus
+catalog refresh is a useful upper estimate at 1 Hz; actual scheduling/HTTP time can
+reduce cadence. Measure node impact before enabling all accounts in production.
+
+Every newly sampled account message is preceded by `walletStatus` containing its
+`scope`, `subscription`, wallet `generation`, `subscriptionGeneration`, server
+`sessionStartedAt`, `sampleStartedAt`, `sampleCompletedAt`, `upstreamTimes`, and
+`atomic:false`. Sample span must be at most 1000 ms; upstream age must be at most
+5000 ms, with 1000 ms future tolerance. These are independent HTTP reads, **not an
+atomic multi-venue snapshot**. A cached resend retains its original timestamps.
+Unchanged spot balances are re-emitted only after fresh authoritative sampling.
+
+For perps, `upstreamTimes` maps DEX names to the original state's `time`. Spot has
+no native snapshot timestamp: `upstreamTimes.observedNodeTime` is a separate local
+`exchangeStatus` observation after the balance query. It is **not** a spot fill
+replay watermark. Host sampling bounds do not prove a causal snapshot/fill boundary.
+A consumer needs explicit reconciliation before using these as inventory baselines.
+
+`orderStatus` supports numeric exchange OIDs (up to signed 64-bit storage range)
+and 16-byte hexadecimal cloids. It looks up the most recent retained local order
+record, preserves full node metadata and exact `statusTimestamp`, and uses the
+standard correlated `post` Info response envelope. It does not manufacture absent
+optional node fields. Required classification fields must be present. Basic
+`orderUpdates` messages retain their existing public-compatible projection.
+Open records become unavailable after a history gap or a later observed fill until
+new order evidence exists; the service never guesses remaining size from history.
+Historical lookups use indexed SQLite reads; recent metadata uses the bounded hot
+cache. Neither requests an L4 snapshot nor queries the public API.
+
+Missing/expired history, disabled wallets, stale ingestion or incomplete metadata
+returns a correlated error beginning `LOCAL_HISTORY_UNAVAILABLE:`. This implementation
+never emits `unknownOid`: its bounded local history cannot certify a complete negative.
+Malformed requests and resource limits can return other correlated errors. Consumers
+must preserve uncertainty and route fallback deliberately, never infer rejection.
+
+Enable every source **and** the follower address explicitly in `WS_WALLETS`; adding
+a source does not automatically authorize the follower. The provided deployment
+script accepts the full comma-separated list. An image update does not change an
+existing container's allowlist.
+
+This is an account/metadata compatibility extension, not full public-WS parity.
+`bbo`, `allMids`, `activeAssetData` subscriptions and unconfigured/spot market books
+remain on the bot's public connection. The local bot adapter must handle walletStatus,
+per-channel freshness and explicit fallback before any endpoint switch.
 
 ## Required gap and freshness handling
 
@@ -199,7 +275,7 @@ for active openOrders subscriptions. Additional clients do not multiply successf
 query rates. Stale/error queries are retried with the configured minimum interval.
 
 `/diagnostics.wallet` reports source heights/times, coverage start, replay state,
-gaps, journal errors, hot-cache size and decode/persist/open-order query timings.
+gaps, journal errors, hot-cache size and decode/persist/open-order/account sample timings.
 Raw wallet history is not exposed by diagnostics. Existing market-data diagnostics
 remain available for before/after comparisons.
 
@@ -268,3 +344,6 @@ startup snapshot. This script has been syntax-checked locally, not run against t
 production host. It does not automatically roll back a runtime startup failure;
 previous image tags remain available. There is no automatic container replacement
 merely from pulling the repository.
+
+See [BOT_HANDOFF.md](BOT_HANDOFF.md) for the independently reviewed bot contract,
+producer epoch semantics, and staged integration/deployment gates.

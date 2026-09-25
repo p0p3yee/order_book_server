@@ -178,13 +178,13 @@ def main():
                     return json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/{path}',timeout=2))
                 assert endpoint('version')['implementation'] == 'hyperliquid-order-book-server/low-latency-ws'
                 capabilities = endpoint('capabilities')
-                assert capabilities['subscriptions'] == ['l2Book','trades','l4Book','userFills','orderUpdates','openOrders']
+                assert capabilities['subscriptions'] == ['l2Book','trades','l4Book','userFills','orderUpdates','openOrders','allDexsClearinghouseState','spotState']
                 assert capabilities['wallet_subscriptions'] is True
                 diagnostic = endpoint('diagnostics')
                 for metric in ['book_apply_us','l2_aggregate_us','ws_dispatch_queue_us','ws_serialize_us','ws_socket_send_us','orders_node_local_to_read_us']:
                     assert diagnostic['metrics'][metric]['count'] > 0, metric
                 assert 'retained_input_bytes' in diagnostic['backlog']
-                for kind in ['orderUpdates','userFills','openOrders']:
+                for kind in ['orderUpdates','userFills','openOrders','allDexsClearinghouseState','spotState']:
                     ws.send({'method':'subscribe','subscription':{'type':kind,'user':'0x'+'0'*40}})
                     assert '--wallets' in ws.until('error')['data']
                 ws.send({'method':'post','id':1,'request':{'type':'info','payload':{'type':'exchangeStatus'}}})

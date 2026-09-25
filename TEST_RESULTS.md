@@ -148,3 +148,32 @@ these do not retroactively change the original local-only test scope above.
   checked. A Linux Docker build and deployment have not been performed here.
 * Exact public aggregate metadata/rounding parity remains unverified. Missing or
   pruned node output cannot be recreated locally; history reports that limitation.
+
+
+## Bot account and metadata compatibility — wallet contract 2
+
+* Rust tests: 65 passed, 2 ignored manual fixtures. Formatting, release build,
+  shell syntax and whitespace checks passed.
+* Added full account-type/freshness validation, cached-sample lease tests, numeric
+  OID/cloid indexed-history lookup with later-fill evidence, and complete metadata
+  validation that fails closed on gaps or incomplete classification fields.
+* `mock_bot_compat_e2e.py` passed with three synthetic wallets and eleven venues:
+  15 subscriptions per connection, full baselines, original scalar types, spot
+  default acknowledgement, sampling companions, numeric/cloid open/canceled/filled
+  lookups, unavailable history, later-fill invalidation and whole-sample suppression
+  after venue failures, stale upstream times and overlong non-atomic sampling.
+* Both existing wallet process modes passed, including disk-write failure,
+  offline replay/rotation, aggregation and continued book delivery. Both book process
+  modes passed after updating the expected capability list for the new subscriptions.
+* The bot agent independently checked the synthetic wire transcript against its
+  acceptance harness and found no local compatibility blocker. The harness lives
+  in the bot workspace; it is not copied into this repository. Initial scoped resets,
+  normalized spot acknowledgements, producer restart identity and lifetime gap
+  counters were explicitly reviewed between agents.
+* No real wallet balances/captured bot source were published as fixtures. No live
+  node/bot was modified or restarted. No live orders were submitted. A Linux image
+  build, deployed-schema verification and paired real-fill observation remain
+  production gates, not claims established by the localhost tests.
+* See BOT_HANDOFF.md: first bot integration is default-off local metadata
+  acceleration with public fallback; non-atomic spot account samples cannot by
+  themselves establish a fill-replay baseline.

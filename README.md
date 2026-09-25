@@ -57,5 +57,6 @@ python3 scripts/mock_e2e.py --stream
 The mock tests are entirely local and never contact your Hyperliquid node.
 
 See [LOCAL_WALLETS.md](LOCAL_WALLETS.md) for opt-in fully local `userFills`,
-`orderUpdates`, and reconciled `openOrders` subscriptions, bounded history,
+`orderUpdates`, reconciled `openOrders`, complete account subscriptions and local
+`orderStatus` lookups, bounded durable history,
 gap handling, performance limits, and deployment. No public wallet relay is used.

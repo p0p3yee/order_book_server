@@ -15,12 +15,14 @@ struct Entry {
     last_orders: Option<Value>,
     query_failed: bool,
     dirty: u64,
+    last_sample: Option<i64>,
 }
 pub(crate) struct Completed {
     sub: WalletSubscription,
     token: u64,
     epoch: u64,
     response: Value,
+    sample: Option<crate::wallet::AccountSample>,
 }
 pub(crate) struct WalletSession {
     pub(crate) hub: WalletHub,
@@ -30,7 +32,10 @@ pub(crate) struct WalletSession {
     token: u64,
 }
 pub(crate) fn is_wallet_request(v: &Value) -> bool {
-    matches!(v["subscription"]["type"].as_str(), Some("userFills" | "orderUpdates" | "openOrders"))
+    matches!(
+        v["subscription"]["type"].as_str(),
+        Some("userFills" | "orderUpdates" | "openOrders" | "allDexsClearinghouseState" | "spotState")
+    )
 }
 fn error(message: impl ToString) -> Value {
     json!({"channel":"error","data":message.to_string()})
@@ -43,10 +48,10 @@ impl WalletSession {
         !self.entries.is_empty()
     }
     pub(crate) fn polls(&self) -> bool {
-        self.entries.keys().any(|s| matches!(s, WalletSubscription::OpenOrders { .. }))
+        self.entries.keys().any(|s| matches!(s, WalletSubscription::OpenOrders { .. }) || s.account())
     }
     pub(crate) fn request(&mut self, value: Value) -> Vec<Value> {
-        let method = value["method"].as_str().unwrap_or("");
+        let method = value["method"].as_str().unwrap_or("").to_string();
         if method != "subscribe" && method != "unsubscribe" {
             return vec![error("Expected subscribe or unsubscribe")];
         }
@@ -55,6 +60,10 @@ impl WalletSession {
             Err(e) => return vec![error(format!("Invalid wallet subscription: {e}"))],
         };
         sub.normalize();
+        let mut value = value;
+        if matches!(sub, WalletSubscription::SpotState { .. }) {
+            value["subscription"]["ignorePortfolioMargin"] = json!(false);
+        }
         if method == "unsubscribe" {
             return if self.entries.remove(&sub).is_some() {
                 vec![json!({"channel":"subscriptionResponse","data":value})]
@@ -76,8 +85,8 @@ impl WalletSession {
         {
             return vec![error("Use separate connections for raw and aggregated fills for the same wallet")];
         }
-        if self.entries.len() >= 8 {
-            return vec![error("Maximum eight wallet subscriptions per connection")];
+        if self.entries.len() >= 128 {
+            return vec![error("Maximum 128 wallet subscriptions per connection")];
         }
         if matches!(&sub, WalletSubscription::OrderUpdates { .. })
             && self.entries.keys().any(|s| matches!(s, WalletSubscription::OrderUpdates { .. }))
@@ -98,6 +107,7 @@ impl WalletSession {
                 last_orders: None,
                 query_failed: false,
                 dirty: 0,
+                last_sample: None,
             },
         );
         let mut messages = vec![json!({"channel":"subscriptionResponse","data":value})];
@@ -134,10 +144,19 @@ impl WalletSession {
             return;
         }
         let epoch = status["generation"].as_u64().unwrap_or_default();
-        for (sub, entry) in &mut self.entries {
-            let WalletSubscription::OpenOrders { user, dex } = sub else { continue };
-            let dirty = self.hub.dirty_version(user, dex);
-            let interval = if dirty != entry.dirty || entry.query_failed {
+        let mut ordered: Vec<_> = self.entries.iter().map(|(s, e)| (e.last_poll, s.clone())).collect();
+        ordered.sort_by_key(|(last, _)| *last);
+        for (_, sub) in ordered {
+            let entry = self.entries.get_mut(&sub).expect("entry from current map");
+            let (user, dex) = match &sub {
+                WalletSubscription::OpenOrders { user, dex } => (user.clone(), dex.clone()),
+                s if s.account() => (s.user().to_string(), String::new()),
+                _ => continue,
+            };
+            let dirty = self.hub.dirty_version(&user, &dex);
+            let interval = if sub.account() {
+                self.hub.accounts.interval
+            } else if dirty != entry.dirty || entry.query_failed {
                 self.hub.event_interval
             } else {
                 self.hub.poll_interval
@@ -156,8 +175,21 @@ impl WalletSession {
             entry.last_poll = Some(Instant::now());
             self.jobs.push(
                 async move {
-                    let response = hub.open_orders(bridge, user, dex, epoch).await;
-                    Completed { sub, token, epoch, response }
+                    if sub.account() {
+                        match hub.sample_account(bridge, sub.clone(), epoch).await {
+                            Ok(sample) => Completed { sub, token, epoch, response: json!(null), sample: Some(sample) },
+                            Err(reason) => Completed {
+                                sub,
+                                token,
+                                epoch,
+                                response: json!({"type":"error","payload":reason}),
+                                sample: None,
+                            },
+                        }
+                    } else {
+                        let response = hub.open_orders(bridge, user, dex, epoch).await;
+                        Completed { sub, token, epoch, response, sample: None }
+                    }
                 }
                 .boxed(),
             );
@@ -172,6 +204,27 @@ impl WalletSession {
         let state = self.hub.status();
         if state["state"] != "Ready" || state["generation"] != result.epoch {
             return vec![];
+        }
+        if result.sub.account() {
+            let Some(sample) = result.sample.filter(|s| s.usable()) else {
+                entry.last_sample = None;
+                if entry.query_failed {
+                    return vec![];
+                }
+                entry.query_failed = true;
+                return vec![
+                    json!({"channel":"walletStatus","data":{"state":"Stale","scope":result.sub.channel(),"user":result.sub.user(),"subscription":result.sub,"generation":result.epoch,"resetRequired":true,"reason":"authoritative account sample unavailable","detail":result.response}}),
+                ];
+            };
+            if entry.last_sample == Some(sample.completed) {
+                return vec![];
+            }
+            entry.last_sample = Some(sample.completed);
+            entry.query_failed = false;
+            return vec![
+                json!({"channel":"walletStatus","data":{"state":"Ready","source":"localNode","scope":result.sub.channel(),"user":result.sub.user(),"subscription":result.sub,"generation":result.epoch,"subscriptionGeneration":result.token,"sessionStartedAt":state["sessionStartedAt"],"resetRequired":false,"historyComplete":false,"gaps":state["gaps"],"journalError":state["journalError"],"sampleStartedAt":sample.started,"sampleCompletedAt":sample.completed,"upstreamTimes":sample.upstream,"atomic":false}}),
+                json!({"channel":result.sub.channel(),"data":sample.data}),
+            ];
         }
         let WalletSubscription::OpenOrders { user, dex } = &result.sub else { return vec![] };
         let mut orders = result.response["payload"]["data"].clone();
@@ -198,6 +251,7 @@ impl WalletSession {
         }
         if entry.last_orders.as_ref() != Some(&orders) {
             entry.last_orders = Some(orders.clone());
+            messages.push(json!({"channel":"walletStatus","data":{"user":user,"scope":"openOrders","subscription":result.sub,"generation":result.epoch,"sessionStartedAt":state["sessionStartedAt"],"state":"Ready","resetRequired":false,"gaps":state["gaps"],"journalError":state["journalError"],"sampleStartedAt":result.response["_localSampleStartedAt"],"sampleCompletedAt":result.response["_localSampleCompletedAt"],"sampleTimeSource":"hostQueryWindow","atomic":false}}));
             messages.push(json!({"channel":"openOrders","data":{"user":user,"dex":dex,"orders":orders}}));
         }
         messages
@@ -242,15 +296,21 @@ mod tests {
                 last_orders: None,
                 query_failed: false,
                 dirty: 0,
+                last_sample: None,
             },
         );
-        let result =
-            Completed { sub: sub.clone(), token: 1, epoch: 0, response: json!({"type":"info","payload":{"data":[]}}) };
+        let result = Completed {
+            sub: sub.clone(),
+            token: 1,
+            epoch: 0,
+            sample: None,
+            response: json!({"type":"info","payload":{"data":[]}}),
+        };
         assert!(session.complete(result).is_empty());
         assert!(session.entries[&sub].pending);
         let messages = session.request(json!({"method":"unsubscribe","subscription":sub}));
         assert_eq!(messages[0]["channel"], "subscriptionResponse");
         assert!(session.entries.is_empty());
-        assert!(session.complete(Completed { sub, token: 2, epoch: 0, response: json!({}) }).is_empty());
+        assert!(session.complete(Completed { sub, token: 2, epoch: 0, sample: None, response: json!({}) }).is_empty());
     }
 }

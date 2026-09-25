@@ -1,6 +1,9 @@
 //! Local-only wallet journal with independent, resumable node-file readers.
 //! Parsing and persistence run on a dedicated worker, never under the book lock.
+mod accounts;
+pub(crate) use accounts::Sample as AccountSample;
 mod aggregate;
+mod orders;
 mod storage;
 use crate::ServerConfig;
 use serde::{Deserialize, Serialize};
@@ -33,6 +36,15 @@ pub(crate) enum WalletSubscription {
     OrderUpdates {
         user: String,
     },
+    AllDexsClearinghouseState {
+        user: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    SpotState {
+        user: String,
+        #[serde(default)]
+        ignore_portfolio_margin: bool,
+    },
     OpenOrders {
         user: String,
         #[serde(default)]
@@ -42,21 +54,32 @@ pub(crate) enum WalletSubscription {
 impl WalletSubscription {
     pub(crate) fn user(&self) -> &str {
         match self {
-            Self::UserFills { user, .. } | Self::OrderUpdates { user } | Self::OpenOrders { user, .. } => user,
+            Self::UserFills { user, .. }
+            | Self::OrderUpdates { user }
+            | Self::OpenOrders { user, .. }
+            | Self::AllDexsClearinghouseState { user }
+            | Self::SpotState { user, .. } => user,
         }
     }
     pub(crate) fn normalize(&mut self) {
         match self {
-            Self::UserFills { user, .. } | Self::OrderUpdates { user } | Self::OpenOrders { user, .. } => {
-                user.make_ascii_lowercase()
-            }
+            Self::UserFills { user, .. }
+            | Self::OrderUpdates { user }
+            | Self::OpenOrders { user, .. }
+            | Self::AllDexsClearinghouseState { user }
+            | Self::SpotState { user, .. } => user.make_ascii_lowercase(),
         }
+    }
+    pub(crate) fn account(&self) -> bool {
+        matches!(self, Self::AllDexsClearinghouseState { .. } | Self::SpotState { .. })
     }
     pub(crate) fn channel(&self) -> &'static str {
         match self {
             Self::UserFills { .. } => "userFills",
             Self::OrderUpdates { .. } => "orderUpdates",
             Self::OpenOrders { .. } => "openOrders",
+            Self::AllDexsClearinghouseState { .. } => "allDexsClearinghouseState",
+            Self::SpotState { .. } => "spotState",
         }
     }
 }
@@ -133,11 +156,14 @@ impl State {
         self.sources = [Source::default(), Source::default()];
         self.reason = reason;
     }
-    fn push(&mut self, user: String, channel: &str, data: Value, key: String) {
+    fn push(&mut self, user: String, channel: &str, mut data: Value, key: String) {
         if !self.keys.insert(key.clone()) {
             return;
         }
         self.seq += 1;
+        if channel == "orderUpdates" {
+            data["_localGapCount"] = json!(self.gaps);
+        }
         let bytes = data.to_string().len() + key.len() + user.len() + 128;
         self.bytes += bytes;
         let coin = data["coin"].as_str().or_else(|| data["order"]["coin"].as_str()).unwrap_or("");
@@ -190,6 +216,7 @@ pub(crate) struct WalletHub {
     metrics: Arc<crate::telemetry::Metrics>,
     order_caches: OrderCaches,
     signal: watch::Sender<u64>,
+    pub(crate) accounts: Arc<accounts::Accounts>,
     pub(crate) poll_interval: Duration,
     pub(crate) event_interval: Duration,
 }
@@ -284,6 +311,7 @@ impl WalletHub {
             metrics: metrics.clone(),
             order_caches: Arc::new(Mutex::new(HashMap::new())),
             signal: signal.clone(),
+            accounts: Arc::new(accounts::Accounts::new(config.wallet_account_interval)),
             poll_interval: config.wallet_poll_interval,
             event_interval: config.wallet_event_interval,
         };
@@ -307,8 +335,8 @@ impl WalletHub {
         let key = (user.clone(), dex.clone());
         let cache = {
             let mut caches = self.order_caches.lock().unwrap_or_else(|e| e.into_inner());
-            if !caches.contains_key(&key) && caches.len() >= 32 {
-                return json!({"type":"error","payload":"429: maximum 32 distinct wallet/dex query keys per process"});
+            if !caches.contains_key(&key) && caches.len() >= 256 {
+                return json!({"type":"error","payload":"429: maximum 256 distinct wallet/dex query keys per process"});
             }
             caches.entry(key).or_default().clone()
         };
@@ -316,7 +344,7 @@ impl WalletHub {
         if cache.response["type"] == "info"
             && cache.epoch == epoch
             && cache.dirty == self.dirty_version(&user, &dex)
-            && cache.fetched.is_some_and(|t| t.elapsed() < self.poll_interval)
+            && cache.fetched.is_some_and(|t| t.elapsed() < self.poll_interval.min(Duration::from_secs(5)))
         {
             return cache.response.clone();
         }
@@ -325,7 +353,8 @@ impl WalletHub {
         }
         let dirty = self.dirty_version(&user, &dex);
         let start = Instant::now();
-        let response = bridge
+        let sampled_at = chrono::Utc::now().timestamp_millis();
+        let mut response = bridge
             .execute(crate::servers::info::PostRequest {
                 id: 0,
                 request: json!({"type":"info",
@@ -333,12 +362,25 @@ impl WalletHub {
             })
             .await
             .response;
+        response["_localSampleStartedAt"] = json!(sampled_at);
+        response["_localSampleCompletedAt"] = json!(chrono::Utc::now().timestamp_millis());
         self.metrics.elapsed("open_orders_query_us", start);
         cache.dirty = dirty;
         cache.epoch = epoch;
         cache.fetched = Some(Instant::now());
         cache.response = response.clone();
         response
+    }
+    pub(crate) async fn sample_account(
+        &self,
+        bridge: crate::servers::info::InfoBridge,
+        sub: WalletSubscription,
+        epoch: u64,
+    ) -> Result<AccountSample, String> {
+        let started = Instant::now();
+        let result = self.accounts.sample(bridge, sub, epoch).await;
+        self.metrics.elapsed("account_sample_us", started);
+        result
     }
     pub(crate) fn dirty_version(&self, user: &str, dex: &str) -> u64 {
         *self.state.lock().unwrap_or_else(|e| e.into_inner()).dirty.get(&(user.into(), dex.into())).unwrap_or(&0)
@@ -369,6 +411,9 @@ impl WalletHub {
     pub(crate) fn validate(&self, sub: &WalletSubscription) -> Result<(), String> {
         if !self.allowed.contains(sub.user()) {
             return Err("wallet not enabled; configure --wallets with this address".into());
+        }
+        if matches!(sub, WalletSubscription::SpotState { ignore_portfolio_margin: true, .. }) {
+            return Err("ignorePortfolioMargin:true is not supported by the local account adapter".into());
         }
         if let WalletSubscription::OpenOrders { dex, .. } = sub {
             if dex.len() > 64 || !dex.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
@@ -461,7 +506,7 @@ impl WalletHub {
                 .filter(|e| {
                     e.user == sub.user() && e.channel == "orderUpdates" && cursor.is_some_and(|(_, seq)| e.seq > seq)
                 })
-                .map(|e| e.data.clone())
+                .map(|e| orders::basic_update(&e.data))
                 .collect();
             if events.is_empty() { vec![] } else { vec![json!({"channel":"orderUpdates","data":events})] }
         } else {
@@ -780,14 +825,8 @@ fn decode(source: usize, line: &str, allowed: &HashSet<String>) -> Result<Decode
             }
             let time: chrono::NaiveDateTime =
                 serde_json::from_value(value["time"].clone()).map_err(|_| "invalid order time")?;
-            let mut basic = serde_json::Map::new();
-            for field in ["coin", "side", "limitPx", "sz", "origSz", "oid", "timestamp", "cloid"] {
-                if let Some(v) = order.get(field) {
-                    basic.insert(field.into(), v.clone());
-                }
-            }
             let data =
-                json!({"order":basic,"status":value["status"],"statusTimestamp":time.and_utc().timestamp_millis()});
+                json!({"order":order,"status":value["status"],"statusTimestamp":time.and_utc().timestamp_millis()});
             let key = format!("o:{user}:{data}");
             ("orderUpdates", data, key)
         };
@@ -814,7 +853,7 @@ fn apply(s: &mut State, source: usize, batch: Decoded, streamed: bool, stale: Du
     let mut batch_keys = HashMap::new();
     for (_, _, data, key) in &batch.events {
         if batch_keys.insert(key, data).is_some_and(|old| old != data)
-            || (s.keys.contains(key) && s.events.iter().any(|e| &e.key == key && &e.data != data))
+            || (s.keys.contains(key) && s.events.iter().any(|e| &e.key == key && !orders::same_record(&e.data, data)))
         {
             return Err("conflicting duplicate wallet event".into());
         }
@@ -855,6 +894,7 @@ mod tests {
             metrics: Arc::new(crate::telemetry::Metrics::default()),
             order_caches: Arc::new(Mutex::new(HashMap::new())),
             signal,
+            accounts: Arc::new(accounts::Accounts::new(Duration::from_secs(1))),
             poll_interval: Duration::from_secs(1),
             event_interval: Duration::from_millis(100),
         }

@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /app/target/release/websocket_server /usr/local/bin/websocket_server
 ENV RUST_LOG=info
 ENV WS_WALLET_POLL_INTERVAL_MS=30000
+ENV WS_WALLET_ACCOUNT_INTERVAL_MS=1000
 USER 1000:1000
 EXPOSE 8000
 ENTRYPOINT ["websocket_server"]

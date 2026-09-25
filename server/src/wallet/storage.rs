@@ -194,6 +194,9 @@ impl Store {
             CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY, user TEXT NOT NULL, channel TEXT NOT NULL, identity TEXT NOT NULL UNIQUE, data TEXT NOT NULL, height INTEGER NOT NULL, time INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS events_user_seq ON events(user,seq);
             CREATE INDEX IF NOT EXISTS events_time ON events(time);
+            CREATE INDEX IF NOT EXISTS order_oid ON events(user,json_extract(data,'$.order.oid'),seq DESC) WHERE channel='orderUpdates';
+            CREATE INDEX IF NOT EXISTS order_cloid ON events(user,lower(json_extract(data,'$.order.cloid')),seq DESC) WHERE channel='orderUpdates';
+            CREATE INDEX IF NOT EXISTS fill_oid ON events(user,json_extract(data,'$.oid'),seq DESC) WHERE channel='userFills';
             CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS gaps(id INTEGER PRIMARY KEY, time INTEGER NOT NULL, reason TEXT NOT NULL);")?;
         Ok(Self { connection })
@@ -243,7 +246,7 @@ impl Store {
             let inserted=tx.execute("INSERT INTO events(seq,user,channel,identity,data,height,time) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(identity) DO NOTHING",params![e.seq,e.user,e.channel,e.key,data,e.height,time])?;
             if inserted == 0 {
                 let old: String = tx.query_row("SELECT data FROM events WHERE identity=?1", [&e.key], |r| r.get(0))?;
-                if old != data {
+                if !orders::same_record(&serde_json::from_str::<Value>(&old)?, &e.data) {
                     return Err("conflicting duplicate in durable wallet history".into());
                 }
             }
@@ -390,5 +393,70 @@ mod tests {
         assert!(history(&path, "u", 4, 10).unwrap()["events"].as_array().unwrap().is_empty());
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Indexed reads preserve the most recent observed state and later-fill evidence.
+pub(super) fn order_record(path: &Path, user: &str, oid: &Value) -> crate::Result<Option<(u64, Value, u64)>> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(Duration::from_millis(200))?;
+    conn.execute_batch("BEGIN")?;
+    let sql = if oid.is_u64() {
+        "SELECT seq,data FROM events WHERE channel='orderUpdates' AND user=?1 AND json_extract(data,'$.order.oid')=?2 ORDER BY seq DESC LIMIT 1"
+    } else {
+        "SELECT seq,data FROM events WHERE channel='orderUpdates' AND user=?1 AND lower(json_extract(data,'$.order.cloid'))=?2 ORDER BY seq DESC LIMIT 1"
+    };
+    let identity = if let Some(n) = oid.as_u64() {
+        rusqlite::types::Value::Integer(n as i64)
+    } else {
+        rusqlite::types::Value::Text(oid.as_str().unwrap_or("").to_ascii_lowercase())
+    };
+    let row: Option<(u64, String)> =
+        conn.query_row(sql, params![user, identity], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let Some((seq, data)) = row else { return Ok(None) };
+    let data: Value = serde_json::from_str(&data)?;
+    let fill:u64=conn.query_row("SELECT COALESCE(MAX(seq),0) FROM events WHERE channel='userFills' AND user=?1 AND json_extract(data,'$.oid')=?2",params![user,data["order"]["oid"].as_u64().unwrap_or(0)],|r|r.get(0))?;
+    Ok(Some((seq, data, fill)))
+}
+
+#[cfg(test)]
+mod order_lookup_tests {
+    use super::*;
+    #[test]
+    fn durable_numeric_and_cloid_lookup_include_subsequent_fill_evidence() {
+        let path = std::env::temp_dir().join(format!("wallet-order-index-{}.sqlite", std::process::id()));
+        drop(std::fs::remove_file(&path));
+        let mut store = Store::open(&path).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let cloid = format!("0x{}", "a".repeat(32));
+        let events = vec![
+            Event {
+                seq: 1,
+                user: "u".into(),
+                channel: "orderUpdates".into(),
+                data: json!({"order":{"oid":7,"cloid":cloid},"statusTimestamp":now}),
+                key: "order".into(),
+                bytes: 1,
+                height: 1,
+            },
+            Event {
+                seq: 2,
+                user: "u".into(),
+                channel: "userFills".into(),
+                data: json!({"oid":7,"time":now}),
+                key: "fill".into(),
+                bytes: 1,
+                height: 1,
+            },
+        ];
+        store.commit(&events, &Default::default(), 2, &[], &ServerConfig::default(), now).unwrap();
+        for identity in [json!(7), json!(cloid.to_uppercase().replacen("0X", "0x", 1))] {
+            let (seq, _, fill) = order_record(&path, "u", &identity).unwrap().unwrap();
+            assert_eq!((seq, fill), (1, 2));
+        }
+        assert!(order_record(&path, "another-wallet", &json!(7)).unwrap().is_none());
+        assert!(order_record(&path, "u", &json!(8)).unwrap().is_none());
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
 }

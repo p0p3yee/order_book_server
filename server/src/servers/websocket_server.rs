@@ -394,6 +394,26 @@ async fn execute_info_post(
     bridge: InfoBridge,
     listener: Arc<Mutex<OrderBookListener>>,
 ) -> PostResponse {
+    if post.request.to_string().len() > 64 * 1024 {
+        return PostResponse::error(post.id, "413: Info payload exceeds 64 KiB limit");
+    }
+    if post.request["type"] == "info" && post.request["payload"]["type"] == "orderStatus" {
+        let _permit = match bridge.acquire() {
+            Ok(p) => p,
+            Err(e) => return PostResponse::error(post.id, e),
+        };
+        let hub = listener.lock().await.wallet.clone();
+        return match hub {
+            Some(hub) => match hub.order_status(post.request["payload"].clone()).await {
+                Ok(data) => PostResponse {
+                    id: post.id,
+                    response: serde_json::json!({"type":"info","payload":{"type":"orderStatus","data":data}}),
+                },
+                Err(e) => PostResponse::error(post.id, e),
+            },
+            None => PostResponse::error(post.id, "LOCAL_HISTORY_UNAVAILABLE: wallet history disabled"),
+        };
+    }
     if post.request["type"] == "info" && post.request["payload"]["type"] == "localWalletHistory" {
         let _permit = match bridge.acquire() {
             Ok(p) => p,
