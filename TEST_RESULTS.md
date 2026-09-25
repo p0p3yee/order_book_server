@@ -177,3 +177,23 @@ these do not retroactively change the original local-only test scope above.
 * See BOT_HANDOFF.md: first bot integration is default-off local metadata
   acceleration with public fallback; non-atomic spot account samples cannot by
   themselves establish a fill-replay baseline.
+
+## Mainnet-sized wallet record recovery regression
+
+Live diagnostics on 362053a showed wallet generation advancing 86 times in about
+20 seconds while the gap counter stayed unchanged. A synthetic >1 MiB order
+record reproduced 68 epoch changes in three seconds: the per-poll byte limit was
+mistaken for evidence of replay backlog even after the last record was consumed.
+
+The worker now checks the consumed cursor against the current file length and
+known rotation state at budget boundaries. Unread/prefetched records, partial
+records, rotation, and truncation cannot pass this check. Work budgets and stale
+checks remain in effect. This avoids artificial recovery boundaries; it does not
+promise no resets during real backlog or upstream stalls.
+
+Regression command: `python3 scripts/mock_wallet_e2e.py --large-records`.
+Rust tests: 66 passed, 2 ignored; release websocket_server build passed.
+The large-record process regression passes after the fix, as do the batch and
+streamed wallet process tests and the three-wallet bot compatibility process test.
+`cargo fmt --check` and `git diff --check` pass. No production latency benefit is
+claimed until the corrected image is manually deployed and observed.

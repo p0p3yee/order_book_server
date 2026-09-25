@@ -21,6 +21,7 @@ OTHER = '0x0000000000000000000000000000000000000002'
 
 def main():
     streamed = '--stream' in sys.argv
+    large_records = '--large-records' in sys.argv
     binary = Path('target/release/websocket_server').resolve()
     state = dict(height=100, stop=False, pause=False, fills=[], orders=[], open=[], fail=False, slow=False, skip=False, queries=0)
     lock = threading.Lock()
@@ -68,7 +69,7 @@ def main():
                             # Multiple same-height fragments in stream mode; identical timestamps.
                             if streamed and events:
                                 for e in events: f.write(json.dumps(dict(batch, events=[e])) + '\n')
-                            else: f.write(json.dumps(batch) + '\n')
+                            else: f.write((' ' * (1024 * 1024) if large_records and i == 0 else '') + json.dumps(batch) + '\n')
                     state['orders'] = []; state['fills'] = []
         threading.Thread(target=producer, daemon=True).start()
         import socket
@@ -96,6 +97,23 @@ def main():
             ws.until('subscriptionResponse')
         try:
             proc = start()
+            if large_records:
+                # A single valid mainnet record can exhaust the poll byte budget.
+                # Reaching EOF on that record must not reset a healthy wallet epoch.
+                samples = []
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    with urllib.request.urlopen(f'http://127.0.0.1:{port}/diagnostics', timeout=2) as r:
+                        samples.append(json.load(r)['wallet'])
+                    time.sleep(.02)
+                generations = {s['generation'] for s in samples}
+                assert len(generations) == 1, f'large-record epoch churn: {sorted(generations)}'
+                assert all(s['state'] == 'Ready' for s in samples), samples
+                assert len({s['gaps'] for s in samples}) == 1, samples
+                assert samples[-1]['orderHeight'] > samples[0]['orderHeight'], samples
+                assert samples[-1]['fillHeight'] > samples[0]['fillHeight'], samples
+                print('PASS large-record wallet readiness stays stable across poll byte limits')
+                return
             a = WS(port); clients.append(a)
             sub(a, 'userFills')
             status = a.until('walletStatus'); assert status['data']['historyComplete'] is False

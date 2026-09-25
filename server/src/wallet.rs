@@ -648,6 +648,15 @@ fn run_worker(
                         break;
                     }
                 }
+                // Hitting a byte/record budget does not imply unread input. Large
+                // complete records routinely consume the entire budget at EOF.
+                // Keep genuine backlog/partial records gated; errors are handled
+                // by the reader's continuity path on the next iteration.
+                if !at_tip[i] {
+                    if let Some(reader) = readers[i].as_mut() {
+                        at_tip[i] = reader.at_tip().unwrap_or(false);
+                    }
+                }
             }
         }
         if last_discovery.elapsed() >= Duration::from_secs(1) {

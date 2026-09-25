@@ -139,6 +139,21 @@ impl Reader {
         self.pending.clear();
         Ok(())
     }
+    /// Non-consuming EOF check after a work-budget boundary. File position alone is
+    /// insufficient because BufReader may have prefetched unprocessed records.
+    pub(super) fn at_tip(&mut self) -> crate::Result<bool> {
+        if self.discovery.elapsed() >= Duration::from_secs(1) {
+            self.files = paths(&self.root)?;
+            self.discovery = Instant::now();
+        }
+        let Some(cursor) = &self.cursor else { return Ok(false) };
+        let path = self.root.join(&cursor.path);
+        let meta = std::fs::metadata(&path)?;
+        if inode(&meta) != cursor.inode || meta.len() < cursor.offset + self.pending.len() as u64 {
+            return Err("wallet source replaced or truncated".into());
+        }
+        Ok(self.pending.is_empty() && meta.len() == cursor.offset && self.files.last() == Some(&path))
+    }
     pub(super) fn next(&mut self) -> crate::Result<Option<String>> {
         if self.discovery.elapsed() >= Duration::from_secs(1) || self.file.is_none() {
             self.files = paths(&self.root)?;
@@ -351,6 +366,35 @@ mod tests {
         assert!(Reader::open(root.clone(), checkpoint).is_err());
         std::fs::remove_file(root.join("1")).unwrap();
         assert!(reader.next().is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn tip_check_uses_consumed_cursor_and_detects_rotation_and_truncation() {
+        use std::io::Write;
+        let root = root("tip");
+        let path = root.join("0");
+        std::fs::write(&path, b"").unwrap();
+        let mut reader = Reader::open(root.clone(), None).unwrap();
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(&vec![b' '; 1024 * 1024]).unwrap();
+        writer.write_all(b"{}\nnext\n").unwrap();
+        assert!(!reader.at_tip().unwrap());
+        assert!(reader.next().unwrap().unwrap().len() > 1024 * 1024);
+        assert!(!reader.at_tip().unwrap()); // next record may already be in BufReader
+        assert_eq!(reader.next().unwrap().unwrap(), "next\n");
+        assert!(reader.at_tip().unwrap()); // no extra next() call required
+        writer.write_all(b"partial").unwrap();
+        assert!(reader.next().unwrap().is_none());
+        assert!(!reader.at_tip().unwrap());
+        writer.write_all(b"\n").unwrap();
+        assert_eq!(reader.next().unwrap().unwrap(), "partial\n");
+        std::fs::write(root.join("1"), b"rotated\n").unwrap();
+        reader.discovery = Instant::now() - Duration::from_secs(2);
+        assert!(!reader.at_tip().unwrap());
+        assert_eq!(reader.next().unwrap().unwrap(), "rotated\n");
+        assert!(reader.at_tip().unwrap());
+        std::fs::write(root.join("1"), b"").unwrap();
+        assert!(reader.at_tip().is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
