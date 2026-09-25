@@ -1,8 +1,9 @@
 # WebSocket Info support and wallet limitations
 
 This implementation now accepts read-only `method:"post"` Info requests on the
-existing `/ws` endpoint. It does not yet implement wallet subscriptions. This is
-an incremental protocol change, not a claim of full public-API compatibility.
+existing `/ws` endpoint. Opt-in fully local wallet subscriptions are documented
+separately in [LOCAL_WALLETS.md](LOCAL_WALLETS.md). Neither feature claims full
+public-API compatibility.
 
 ## Requests and responses
 
@@ -47,19 +48,13 @@ Limits apply to the adapter. Cooperative async timeouts cannot preempt synchrono
 book computation or an already executing upstream operation. Slow socket writes
 remain a per-client transport constraint as before.
 
-## Remaining wallet work
+## Wallet subscriptions
 
-`orderUpdates`, `userFills`, and the `openOrders` **subscription** remain unsupported.
-The `openOrders` Info query above is a request/response state query, not an event
-stream. Local node HTTP `userFills` was observed returning 422; it cannot provide
-the historical fill snapshot required for transparent public-protocol parity.
-
-A local implementation needs an unfiltered wallet event dispatcher, a defined
-fill-history/replay store, explicit gap handling, and open-order reconciliation.
-A public-stream relay instead needs explicit user acceptance of that data source,
-reconnect/resubscribe handling, and separate upstream health. Neither approach
-should be silently substituted for the other. Existing market filtering must
-not accidentally remove a wallet's spot or other-DEX activity.
+`orderUpdates`, `userFills`, and `openOrders` subscriptions are available with
+`--wallets` / `WS_WALLETS`. See [LOCAL_WALLETS.md](LOCAL_WALLETS.md) for bounded
+history, required walletStatus gap handling, and authoritative openOrders polling.
+The Info adapter itself remains request/response; it does not synthesize historical
+HTTP `userFills` support that the local node lacks. No public wallet relay is used.
 
 Latency also has two distinct measures: matching-event arrival delay and freshness
 of the latest available book. More frequent local updates can improve the latter
@@ -72,5 +67,6 @@ Unit tests cover query preservation, rejection of actions/snapshots/oversized
 payloads, correlated errors, and the global concurrency bound. Both mock file
 modes exercise Info success, slow responses with continued L2 delivery, HTTP 503,
 timeout, invalid JSON, oversized responses, per-client overload, and local L2 Info.
-Wallet subscriptions still return explicit unsupported errors on the same connection.
-Production deployment and wallet-stream integration are not covered by these mocks.
+Unconfigured wallets return explicit allowlist errors without disconnecting.
+The separate `mock_wallet_e2e.py` tests wallet delivery and recovery in both file
+modes. These mocks do not substitute for verification on the actual node.

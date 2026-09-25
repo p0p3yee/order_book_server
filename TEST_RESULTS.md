@@ -93,3 +93,29 @@ these do not retroactively change the original local-only test scope above.
   a node, payload preservation and rejection, and correlated error envelopes.
 * The production container was not changed. Wallet subscriptions are not implemented
   by this increment; no public wallet feed is contacted or relayed.
+
+## Fully local wallets follow-up
+
+* `cargo fmt --check`, `git diff --check`, and native release build passed.
+* `cargo test --locked`: 55 passed, 2 ignored manual timing fixtures.
+* New tests cover individual fills without a counterparty, extra fee preservation,
+  market-independent wallet filtering, streamed fragments, self-trade identity,
+  duplicate/conflicting fills, order original size/time, missing fields, batch
+  gaps, journal retention/cursor resets, queue overflow, journal restart/corruption,
+  invalid open-order responses and unsubscribe/in-flight token safety.
+* `mock_wallet_e2e.py` passed in batch and stream modes: actual WS/file/HTTP process
+  delivery, wallet isolation, reconnect snapshots, slow HTTP with continued L2,
+  shared query caching across clients, failed-query recovery, missed blocks/stale
+  inputs on the same socket, allowlist/aggregation errors, journal write failures
+  with continued book delivery, and retained fills across process restart.
+* Existing `mock_e2e.py` passed both modes, preserving book validation, recovery,
+  no periodic full snapshot loop, Info behavior and stable socket tests.
+* Four host-collector unit tests passed. Python syntax and deployment script shell
+  syntax checks passed. The deployment script was not run against a real server.
+* Release-mode wallet parser fixture ran separately: 100 x 1000-order unselected
+  batches, 345099 bytes each, wallet filtering 38.12 ms total versus existing typed
+  book parsing 63.49 ms. Filtering is additional worker work, not a mainnet speedup.
+* No Linux Docker image build or production wallet performance/schema validation
+  is claimed. The daemon running on the user's node was not modified or restarted.
+* History remains bounded/partial with explicit gaps; openOrders is authoritative
+  polling, not a per-event replica of the public subscription implementation.

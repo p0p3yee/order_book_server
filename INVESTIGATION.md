@@ -6,7 +6,9 @@ in the host collector. That correction does not require a WS container rebuild.
 
 Protocol follow-up: [WS_INFO.md](WS_INFO.md) describes newly implemented read-only
 WebSocket Info posts. The unsupported-post findings below describe the earlier
-deployed version. Wallet subscriptions remain unsupported.
+deployed version. Fully local wallet subscriptions are now implemented as an
+opt-in feature; see [LOCAL_WALLETS.md](LOCAL_WALLETS.md). Historical findings below
+refer to the tested earlier deployments.
 
 ## Findings and evidence
 

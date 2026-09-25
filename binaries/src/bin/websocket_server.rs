@@ -28,6 +28,14 @@ struct Args {
     markets: Vec<String>,
     #[arg(long)]
     stream_with_block_info: bool,
+    /// Wallets to index locally (no public API fallback).
+    #[arg(long, env = "WS_WALLETS", value_delimiter = ',')]
+    wallets: Vec<String>,
+    /// Persistent bounded wallet journal (defaults to node-data-dir/ws-wallet-journal.json).
+    #[arg(long, env = "WS_WALLET_JOURNAL_PATH")]
+    wallet_journal_path: Option<std::path::PathBuf>,
+    #[arg(long, env = "WS_WALLET_POLL_INTERVAL_MS", default_value_t = 1000)]
+    wallet_poll_interval_ms: u64,
     #[arg(long, default_value_t = 5)]
     poll_interval_ms: u64,
     #[arg(long, default_value_t = 5)]
@@ -86,6 +94,10 @@ async fn main() -> Result<()> {
     config.fills_dir = args.fills_dir;
     config.markets = args.markets.into_iter().collect();
     config.stream_with_block_info = args.stream_with_block_info;
+    config.wallets =
+        args.wallets.into_iter().map(|w| w.trim().to_ascii_lowercase()).filter(|w| !w.is_empty()).collect();
+    config.wallet_journal_path = args.wallet_journal_path;
+    config.wallet_poll_interval = std::time::Duration::from_millis(args.wallet_poll_interval_ms);
     config.poll_interval = std::time::Duration::from_millis(args.poll_interval_ms);
     config.stale_after = std::time::Duration::from_secs(args.stale_after_secs);
     config.snapshot_timeout = std::time::Duration::from_secs(args.snapshot_timeout_secs);

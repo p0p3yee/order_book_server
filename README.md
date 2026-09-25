@@ -6,7 +6,7 @@ This was a standalone project, not written by the Hyperliquid Labs core team. It
 
 ## Functionality
 
-This server provides the `l2book` and `trades` endpoints from [Hyperliquid’s official API](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions), with roughly the same API.
+This server provides the `l2Book` and `trades` endpoints from [Hyperliquid’s official API](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions), with roughly the same API.
 
 - The `l2book` subscription now includes an optional field:
   `nLevels`, which can be up to `100` and defaults to `20`.
@@ -55,3 +55,7 @@ python3 scripts/mock_e2e.py --stream
 ```
 
 The mock tests are entirely local and never contact your Hyperliquid node.
+
+See [LOCAL_WALLETS.md](LOCAL_WALLETS.md) for opt-in fully local `userFills`,
+`orderUpdates`, and reconciled `openOrders` subscriptions, bounded history,
+gap handling, performance limits, and deployment. No public wallet relay is used.

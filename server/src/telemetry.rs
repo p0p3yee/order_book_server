@@ -115,12 +115,13 @@ pub(crate) fn version() -> Value {
         "diagnostics_schema":1})
 }
 pub(crate) fn capabilities() -> Value {
-    json!({"server":version(),"subscriptions":["l2Book","trades","l4Book"],
-        "methods":["subscribe","unsubscribe","post"],"wallet_subscriptions":false,"websocket_info_post":true,
+    json!({"server":version(),"subscriptions":["l2Book","trades","l4Book","userFills","orderUpdates","openOrders"],
+        "methods":["subscribe","unsubscribe","post"],"wallet_subscriptions":true,"websocket_info_post":true,
         "websocket_info_queries":crate::servers::info::QUERIES,"websocket_actions":false,
         "info_post_limits":{"per_connection":4,"global":16,"timeout_ms":2000,"response_bytes":2097152},
         "l2_default_depth":20,"l2_depth_parameter":"nLevels","l2_max_depth":100,
-        "wallet_info_transport":"Node HTTP Info or WebSocket post/info for supported read-only queries; wallet subscriptions are not implemented"})
+        "wallet_info_transport":"Local node outputs and local Info only; configure --wallets",
+        "wallet_limits":{"max_configured_wallets":16,"max_subscriptions_per_connection":8,"history_events":2000,"history_bytes":2097152,"aggregateByTime":false,"openOrders_transport":"authoritative frontendOpenOrders polling","default_poll_ms":1000,"historyComplete":false,"gap_channel":"walletStatus"}})
 }
 
 #[cfg(test)]

@@ -36,12 +36,15 @@ pub async fn run_websocket_server(
 ) -> Result<()> {
     config.validate()?;
     let info_bridge = InfoBridge::new(config.info_url.clone())?;
+    let wallet = crate::wallet::WalletHub::new(&config)?;
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
 
     // Central task: listen to messages and forward them for distribution
     let listener = {
         let internal_message_tx = internal_message_tx.clone();
-        OrderBookListener::new(internal_message_tx, config.clone())
+        let mut book = OrderBookListener::new(internal_message_tx, config.clone());
+        book.wallet = Some(wallet.clone());
+        book
     };
     let listener = Arc::new(Mutex::new(listener));
     {
@@ -161,6 +164,10 @@ async fn handle_socket_inner(
     _ignore_spot: bool,
     info_bridge: InfoBridge,
 ) {
+    let Some(wallet) = listener.lock().await.wallet.clone() else { return };
+    let mut wallets = super::wallet_socket::WalletSession::new(wallet);
+    let mut wallet_tick = tokio::time::interval(wallets.hub.poll_interval);
+    wallet_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut info_jobs = FuturesUnordered::<BoxFuture<'static, PostResponse>>::new();
     let mut internal_message_rx = internal_message_tx.subscribe();
     let mut manager = SubscriptionManager::default();
@@ -170,6 +177,15 @@ async fn handle_socket_inner(
     send_socket_message(&mut socket, ServerResponse::Status(listener.lock().await.status.clone())).await;
     loop {
         select! {
+            _ = wallet_tick.tick(), if wallets.polls() => { wallets.schedule(info_bridge.clone()); }
+            _ = wallets.signal.changed(), if wallets.active() => {
+                telemetry::dispatch(None);
+                for message in wallets.updates() { send_socket_value(&mut socket, message).await; }
+            }
+            Some(result) = wallets.jobs.next(), if !wallets.jobs.is_empty() => {
+                telemetry::dispatch(None);
+                for message in wallets.complete(result) { send_socket_value(&mut socket, message).await; }
+            }
             Some(response) = info_jobs.next(), if !info_jobs.is_empty() => {
                 telemetry::dispatch(None);
                 send_socket_message(&mut socket, ServerResponse::Post(response)).await;
@@ -254,6 +270,11 @@ async fn handle_socket_inner(
                                 continue;
                             }
                             if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                                if super::wallet_socket::is_wallet_request(&value) {
+                                    for message in wallets.request(value) { send_socket_value(&mut socket, message).await; }
+                                    wallets.schedule(info_bridge.clone());
+                                    continue;
+                                }
                                 if value["method"] == "post" {
                                     match serde_json::from_value::<PostRequest>(value) {
                                         Ok(post) if info_jobs.len() < MAX_PENDING => {
@@ -421,6 +442,10 @@ fn unsupported_request_message(text: &str) -> String {
 }
 
 async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
+    send_socket_value(socket, msg).await;
+}
+
+async fn send_socket_value(socket: &mut WebSocket, msg: impl serde::Serialize) {
     let metrics = telemetry::socket_metrics();
     let trace = telemetry::socket_trace();
     let serialize_start = std::time::Instant::now();

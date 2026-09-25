@@ -11,6 +11,10 @@ pub struct ServerConfig {
     pub book_diff_dir: Option<PathBuf>,
     pub fills_dir: Option<PathBuf>,
     pub markets: HashSet<String>,
+    /// Explicit wallet allowlist; empty disables wallet ingestion.
+    pub wallets: HashSet<String>,
+    pub wallet_journal_path: Option<PathBuf>,
+    pub wallet_poll_interval: Duration,
     pub stream_with_block_info: bool,
     pub stale_after: Duration,
     pub poll_interval: Duration,
@@ -33,6 +37,9 @@ impl Default for ServerConfig {
             book_diff_dir: None,
             fills_dir: None,
             markets: HashSet::new(),
+            wallets: HashSet::new(),
+            wallet_journal_path: None,
+            wallet_poll_interval: Duration::from_secs(1),
             stream_with_block_info: false,
             poll_interval: Duration::from_millis(5),
             stale_after: Duration::from_secs(5),
@@ -48,6 +55,12 @@ impl ServerConfig {
         !coin.starts_with('@') && (self.markets.is_empty() || self.markets.contains(coin))
     }
     pub(crate) fn validate(&self) -> crate::Result<()> {
+        if self.wallets.len() > 16 || self.wallets.iter().any(|w| !crate::wallet::valid_address(w)) {
+            return Err("wallets must contain at most 16 valid 0x addresses".into());
+        }
+        if self.wallet_poll_interval < Duration::from_millis(250) {
+            return Err("wallet polling interval must be at least 250 ms".into());
+        }
         if !self.data_dir.is_dir() {
             return Err("node data directory does not exist".into());
         }

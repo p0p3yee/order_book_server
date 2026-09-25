@@ -7,6 +7,7 @@ mod prelude;
 mod servers;
 mod telemetry;
 mod types;
+mod wallet;
 
 pub use prelude::Result;
 pub use servers::websocket_server::run_websocket_server;

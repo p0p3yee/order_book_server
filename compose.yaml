@@ -11,6 +11,9 @@ services:
     network_mode: host
     user: "${WS_UID:-1000}:${WS_GID:-1000}"
     environment:
+      WS_WALLETS: "${WS_WALLETS:-}"
+      WS_WALLET_JOURNAL_PATH: /node-data/ws-wallet-journal.json
+      WS_WALLET_POLL_INTERVAL_MS: "${WS_WALLET_POLL_INTERVAL_MS:-1000}"
       RUST_LOG: "${RUST_LOG:-info}"
       RAYON_NUM_THREADS: "${RAYON_NUM_THREADS:-2}"
       TOKIO_WORKER_THREADS: "${TOKIO_WORKER_THREADS:-2}"

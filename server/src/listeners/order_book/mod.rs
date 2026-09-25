@@ -63,6 +63,7 @@ pub(crate) struct OrderBookListener {
     last_progress: Instant,
     latest_trace: Option<Trace>,
     pub(crate) metrics: Arc<Metrics>,
+    pub(crate) wallet: Option<crate::wallet::WalletHub>,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     pub(crate) l2_subscriptions: Arc<std::sync::Mutex<HashMap<Subscription, usize>>>,
 }
@@ -91,6 +92,7 @@ impl OrderBookListener {
             last_progress: Instant::now(),
             latest_trace: None,
             metrics: Arc::new(Metrics::default()),
+            wallet: None,
             internal_message_tx: tx,
             l2_subscriptions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -115,6 +117,9 @@ impl OrderBookListener {
         let repeated = self.state.is_none() && self.status.reason == reason;
         if !repeated {
             warn!("book recovery height={:?} reason={reason}", self.status.height);
+        }
+        if let Some(wallet) = &self.wallet {
+            wallet.gap(&format!("book/input recovery: {reason}"));
         }
         self.status.generation += 1;
         self.status.resyncs += 1;
@@ -200,6 +205,7 @@ impl OrderBookListener {
                 "stale_after_ms":self.config.stale_after.as_millis(),
                 "stream_with_block_info":self.config.stream_with_block_info,
                 "integrity_interval_secs":self.config.integrity_interval.as_secs()},
+            "wallet":self.wallet.as_ref().map(|w|w.status()),
             "l2_demand":{"markets":requested.len(),"variants":requested.values().map(HashSet::len).sum::<usize>()},
             "backlog":{"order_blocks":self.orders.len(),"diff_blocks":self.diffs.len(),
                 "retained_input_bytes":self.retained_input_bytes(),
@@ -214,6 +220,9 @@ impl OrderBookListener {
             + self.fills.as_ref().map_or(0, |b| b.input_bytes)
     }
     fn ingest_observed(&mut self, source: usize, line: &str, first_read: Instant, read_us: i64) -> Result<()> {
+        if let Some(wallet) = &self.wallet {
+            wallet.tap(source, line);
+        }
         let ingest_start = Instant::now();
         self.buffered_bytes = self.buffered_bytes.saturating_add(line.len());
         if self.buffered_bytes > self.config.max_buffer_bytes {
