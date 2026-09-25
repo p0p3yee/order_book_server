@@ -166,7 +166,7 @@ async fn handle_socket_inner(
 ) {
     let Some(wallet) = listener.lock().await.wallet.clone() else { return };
     let mut wallets = super::wallet_socket::WalletSession::new(wallet);
-    let mut wallet_tick = tokio::time::interval(wallets.hub.poll_interval);
+    let mut wallet_tick = tokio::time::interval(wallets.hub.event_interval);
     wallet_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut info_jobs = FuturesUnordered::<BoxFuture<'static, PostResponse>>::new();
     let mut internal_message_rx = internal_message_tx.subscribe();
@@ -181,6 +181,7 @@ async fn handle_socket_inner(
             _ = wallets.signal.changed(), if wallets.active() => {
                 telemetry::dispatch(None);
                 for message in wallets.updates() { send_socket_value(&mut socket, message).await; }
+                wallets.schedule(info_bridge.clone());
             }
             Some(result) = wallets.jobs.next(), if !wallets.jobs.is_empty() => {
                 telemetry::dispatch(None);
@@ -393,6 +394,23 @@ async fn execute_info_post(
     bridge: InfoBridge,
     listener: Arc<Mutex<OrderBookListener>>,
 ) -> PostResponse {
+    if post.request["type"] == "info" && post.request["payload"]["type"] == "localWalletHistory" {
+        let _permit = match bridge.acquire() {
+            Ok(p) => p,
+            Err(e) => return PostResponse::error(post.id, e),
+        };
+        let hub = listener.lock().await.wallet.clone();
+        return match hub {
+            Some(hub) => match hub.history(post.request["payload"].clone()).await {
+                Ok(data) => PostResponse {
+                    id: post.id,
+                    response: serde_json::json!({"type":"info","payload":{"type":"localWalletHistory","data":data}}),
+                },
+                Err(e) => PostResponse::error(post.id, e),
+            },
+            None => PostResponse::error(post.id, "wallet history disabled"),
+        };
+    }
     if post.request["type"] != "info" || post.request["payload"]["type"] != "l2Book" {
         return bridge.execute(post).await;
     }

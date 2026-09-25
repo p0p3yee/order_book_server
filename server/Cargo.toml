@@ -16,6 +16,9 @@ futures-util = "0.3.31"
 rayon = "1.10"
 alloy = "1.0.22"
 reqwest = "0.12.22"
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+num-bigint = "0.4"
+num-traits = "0.2"
 yawc = { version = "0.2.6", features = ["axum"] }
 
 [lints]

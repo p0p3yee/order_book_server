@@ -117,11 +117,11 @@ pub(crate) fn version() -> Value {
 pub(crate) fn capabilities() -> Value {
     json!({"server":version(),"subscriptions":["l2Book","trades","l4Book","userFills","orderUpdates","openOrders"],
         "methods":["subscribe","unsubscribe","post"],"wallet_subscriptions":true,"websocket_info_post":true,
-        "websocket_info_queries":crate::servers::info::QUERIES,"websocket_actions":false,
+        "websocket_info_queries":crate::servers::info::QUERIES,"local_info_extensions":["localWalletHistory"],"websocket_actions":false,
         "info_post_limits":{"per_connection":4,"global":16,"timeout_ms":2000,"response_bytes":2097152},
         "l2_default_depth":20,"l2_depth_parameter":"nLevels","l2_max_depth":100,
         "wallet_info_transport":"Local node outputs and local Info only; configure --wallets",
-        "wallet_limits":{"max_configured_wallets":16,"max_subscriptions_per_connection":8,"history_events":2000,"history_bytes":2097152,"aggregateByTime":false,"openOrders_transport":"authoritative frontendOpenOrders polling","default_poll_ms":1000,"historyComplete":false,"gap_channel":"walletStatus"}})
+        "wallet_limits":{"max_configured_wallets":16,"max_subscriptions_per_connection":8,"history_events":2000,"history_bytes":2097152,"aggregateByTime":true,"aggregation_metadata":"first constituent; weighted px rounded to 18 decimals; public parity unverified","openOrders_transport":"event-triggered authoritative frontendOpenOrders with reconciliation","default_poll_ms":30000,"default_event_interval_ms":100,"default_disk_history_events":100000,"default_disk_history_days":7,"history_storage":"SQLite WAL + transactional source cursors","historyComplete":false,"gap_channel":"walletStatus"}})
 }
 
 #[cfg(test)]

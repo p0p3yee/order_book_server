@@ -14,6 +14,7 @@ struct Entry {
     last_poll: Option<Instant>,
     last_orders: Option<Value>,
     query_failed: bool,
+    dirty: u64,
 }
 pub(crate) struct Completed {
     sub: WalletSubscription,
@@ -67,6 +68,14 @@ impl WalletSession {
         if self.entries.contains_key(&sub) {
             return vec![error("Wallet subscription already active")];
         }
+        if matches!(sub, WalletSubscription::UserFills { .. })
+            && self
+                .entries
+                .keys()
+                .any(|other| matches!(other, WalletSubscription::UserFills { .. }) && other.user() == sub.user())
+        {
+            return vec![error("Use separate connections for raw and aggregated fills for the same wallet")];
+        }
         if self.entries.len() >= 8 {
             return vec![error("Maximum eight wallet subscriptions per connection")];
         }
@@ -88,6 +97,7 @@ impl WalletSession {
                 last_poll: None,
                 last_orders: None,
                 query_failed: false,
+                dirty: 0,
             },
         );
         let mut messages = vec![json!({"channel":"subscriptionResponse","data":value})];
@@ -126,10 +136,13 @@ impl WalletSession {
         let epoch = status["generation"].as_u64().unwrap_or_default();
         for (sub, entry) in &mut self.entries {
             let WalletSubscription::OpenOrders { user, dex } = sub else { continue };
-            if self.jobs.len() >= 4
-                || entry.pending
-                || entry.last_poll.is_some_and(|t| t.elapsed() < self.hub.poll_interval)
-            {
+            let dirty = self.hub.dirty_version(user, dex);
+            let interval = if dirty != entry.dirty || entry.query_failed {
+                self.hub.event_interval
+            } else {
+                self.hub.poll_interval
+            };
+            if self.jobs.len() >= 4 || entry.pending || entry.last_poll.is_some_and(|t| t.elapsed() < interval) {
                 continue;
             }
             let bridge = bridge.clone();
@@ -138,6 +151,7 @@ impl WalletSession {
             let user = user.clone();
             let dex = dex.clone();
             let hub = self.hub.clone();
+            entry.dirty = dirty;
             entry.pending = true;
             entry.last_poll = Some(Instant::now());
             self.jobs.push(
@@ -227,6 +241,7 @@ mod tests {
                 last_poll: None,
                 last_orders: None,
                 query_failed: false,
+                dirty: 0,
             },
         );
         let result =

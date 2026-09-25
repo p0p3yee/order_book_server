@@ -118,9 +118,6 @@ impl OrderBookListener {
         if !repeated {
             warn!("book recovery height={:?} reason={reason}", self.status.height);
         }
-        if let Some(wallet) = &self.wallet {
-            wallet.gap(&format!("book/input recovery: {reason}"));
-        }
         self.status.generation += 1;
         self.status.resyncs += 1;
         self.status.state = if stale { Health::Stale } else { Health::Resyncing };
@@ -220,9 +217,6 @@ impl OrderBookListener {
             + self.fills.as_ref().map_or(0, |b| b.input_bytes)
     }
     fn ingest_observed(&mut self, source: usize, line: &str, first_read: Instant, read_us: i64) -> Result<()> {
-        if let Some(wallet) = &self.wallet {
-            wallet.tap(source, line);
-        }
         let ingest_start = Instant::now();
         self.buffered_bytes = self.buffered_bytes.saturating_add(line.len());
         if self.buffered_bytes > self.config.max_buffer_bytes {

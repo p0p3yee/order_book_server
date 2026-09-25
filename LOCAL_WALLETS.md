@@ -22,7 +22,7 @@ The node flags already used in this deployment supply the data:
 
 Keep these flags for the first comparison. `--stream-with-block-info` is also
 supported by the wallet worker when the WS process has its matching flag. Wallet
-events are delivered per record, without waiting for a subsequent block. Existing
+raw fills and order events are delivered per record, without waiting for a subsequent block. Aggregated fills wait until the next fill-source block confirms completion. Existing
 book reconstruction still waits for complete blocks. Streaming mode cannot prove
 that a fragment inside a block was not silently omitted; file errors and regressions
 are detected, and sparse heights alone are not treated as proof of a wallet gap.
@@ -34,8 +34,11 @@ Optional settings:
 
 | CLI | Environment | Default |
 |---|---|---|
-| `--wallet-journal-path` | `WS_WALLET_JOURNAL_PATH` | `NODE_DATA_DIR/ws-wallet-journal.json` |
-| `--wallet-poll-interval-ms` | `WS_WALLET_POLL_INTERVAL_MS` | 1000 ms; minimum 250 ms |
+| `--wallet-journal-path` | `WS_WALLET_JOURNAL_PATH` | `NODE_DATA_DIR/ws-wallet-journal.sqlite` (legacy `.json` path migrates automatically) |
+| `--wallet-poll-interval-ms` | `WS_WALLET_POLL_INTERVAL_MS` | 30000 ms reconciliation; minimum 250 ms |
+| `--wallet-event-interval-ms` | `WS_WALLET_EVENT_INTERVAL_MS` | 100 ms minimum interval between event-triggered queries |
+| `--wallet-history-events` | `WS_WALLET_HISTORY_EVENTS` | 100000 combined disk events; range 2000–1000000 |
+| `--wallet-history-days` | `WS_WALLET_HISTORY_DAYS` | 7 days; range 1–3650 |
 
 The journal path must be writable, persistent, and dedicated to this one WS
 process. Do not point it at a node-owned file or share it between running replicas.
@@ -55,7 +58,7 @@ Unsubscribe with the same subscription and `method:"unsubscribe"`.
 
 - `userFills`: standard `{user,isSnapshot,fills}` data. Initial/reset snapshots
   contain retained local fills, then live individual fills. `aggregateByTime:true`
-  is explicitly rejected; false/omitted is supported. Fees and extra node fill
+  combines partial fills as described below; false/omitted preserves raw fills. Fees and extra node fill
   fields are preserved. A missing counterparty does not suppress a wallet's fill.
   Identity includes wallet, coin, time, tid, oid and side, retaining both sides of
   a self-trade while deduplicating replayed observations. Conflicting duplicates
@@ -66,9 +69,10 @@ Unsubscribe with the same subscription and `method:"unsubscribe"`.
   of open orders. Use `openOrders` for reconciliation. Only one orderUpdates wallet
   per WS connection is allowed because the official response has no user field.
 - `openOrders`: `{user,dex,orders}` snapshots queried from local
-  `frontendOpenOrders`, sent initially and on changes. These are **polled
-  authoritative snapshots**, not per-event public-server-equivalent updates.
-  The default interval is one second plus query/scheduling time. Intermediate
+  `frontendOpenOrders`, sent initially and when the result changes. Relevant fills/order
+  events trigger a refresh, coalesced to at most one query per 100 ms per wallet/DEX.
+  A 30-second reconciliation timer catches state changes absent from observed events.
+  These remain authoritative state snapshots. Intermediate
   open/cancel transitions can be absent; use `orderUpdates` for those. Polls are
   shared per wallet/DEX across clients, single-flight, with bounded HTTP size,
   concurrency and timeouts. No older file events are merged onto a newer HTTP
@@ -104,48 +108,100 @@ Bot behavior:
    from a real input gap cannot be recreated from current open orders.
 3. Treat `historyComplete:false` literally. An empty fills snapshot means no
    retained observations, not proof of no previous trades. New subscriptions,
-   worker overflow, lost retained history, process restarts and input discontinuity
+   lost retained history, file replay, process restarts and input discontinuity
    are explicitly distinguished from uninterrupted delivery.
 4. Apply the bot's own event-age limits. A stale market book should not trigger a
    full L4 snapshot merely to chase freshness.
 
-A bounded journal preserves up to 2000 combined fill/order events with a 2 MiB
-accounted payload/key budget across configured wallets. Actual JSON size includes
-encoding overhead (bounded load limit 6 MiB); atomic replacement can temporarily
-hold the previous file and its replacement. This is a small local history, not an
-archive. A busy wallet can evict another wallet's older events; lagging cursors
-receive reset notifications. Snapshots include the available retained fills only.
+The hot cache holds at most 2000 combined events and 2 MiB of accounted payload/key
+bytes across wallets. The separate SQLite history defaults to 100000 events or seven
+days, whichever removes an event first. A busy wallet can evict another wallet's
+older events. Hot-cache overflow causes a subscription reset; it does **not** erase
+events still retained on disk. Disk retention is an event count/time limit, not a
+fixed byte limit: payloads can be up to 64 KiB. SQLite reuses freed pages but does
+not automatically shrink its file. Include the database, `-wal`, and `-shm` in
+capacity planning; use SQLite's backup API for a consistent live backup.
 
-Changed history is checkpointed approximately once per second with atomic rename
-and file sync on the worker. A crash or slow disk can lose uncheckpointed events;
-no exactly-once or gapless-restart claim is made. Every restart begins a new live
-boundary and reports historical incompleteness. The service starts tailing near
-current output and does not scan old node files to backfill downtime. Journal
-write failure is exposed as `journalError`; live delivery can continue without
-pretending persistence succeeded. A malformed/oversized journal is an explicit
-startup error; preserve it for diagnosis before choosing a fresh journal path.
+The worker commits selected events and both input-file positions in one SQLite WAL
+transaction approximately once per second (or after 256 selected events), with
+FULL synchronization. After restart it resumes those positions and catches up
+before marking the wallet feed Ready. This also recovers uncommitted records if
+the node files still exist. No genesis replay is needed. Preserve node output for
+at least the longest expected WS outage; a pruned/replaced/truncated file produces
+an explicit persisted gap and a fresh live boundary. An absent historical input
+cannot be reconstructed from an account's current state.
+
+Persistence failure pauses wallet ingestion/publication and retries once per
+second. Book processing and existing sockets continue. Recovery then reads retained
+input. Live messages can precede the next disk commit; clients must deduplicate
+replayed fills after a restart. This is not an exactly-once delivery protocol.
+
+Existing `.json` journal paths automatically use a sibling `.sqlite` file and
+import legacy retained events on first initialization. The old JSON is preserved.
+Legacy data has no file cursors, so migration records an explicit coverage gap.
+Reuse the same persistent volume and path on upgrades. Do not run two instances
+against one journal. Storage corruption at startup is an error, not a silent reset.
+
+### Retrieve disk history
+
+This custom, local-only WebSocket Info request returns raw fills and order events:
+
+```json
+{"method":"post","id":10,"request":{"type":"info","payload":{"type":"localWalletHistory","user":"0x0000000000000000000000000000000000000001","afterSequence":0,"limit":100}}}
+```
+
+The response contains `events` with `sequence`, `channel`, `data`, and `height`;
+`nextSequence`, `hasMore`, `oldestRetainedSequence`, and recent `gaps`. Continue
+using `afterSequence:nextSequence`. Limits are 1–1000 events and 1 MiB of event
+JSON per page. Only configured wallets can be queried. Results include committed
+history, which can trail live delivery by the checkpoint interval. Sequence numbers
+are global across wallets, so jumps alone do not prove missing wallet events.
+`historyComplete:false` still applies to the full account lifetime, especially
+before collection, after actual lost input, or beyond retention.
+
+### Aggregated fills
+
+Set `aggregateByTime:true` on a `userFills` subscription. Crossing fills are grouped
+by wallet, coin, order ID, side, fee token and execution hash. Resting-order fills
+are grouped within a block. Size, fee, closed PnL and optional builder/deployer fees
+are summed with exact decimal arithmetic; price is the size-weighted mean rounded
+half away from zero to 18 decimal places. First-constituent identifiers, timestamp,
+start position and direction are retained. Raw fills remain available separately.
+
+The [official grouping rules](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint)
+do not fully specify metadata tie-breaking or price rounding. These local choices
+are explicit; exact public-server field parity has **not** been empirically verified.
+Use separate connections for raw and aggregated subscriptions for the same wallet,
+since their response channel does not identify the aggregation mode.
+
+Streamed mode waits for the next fill-source height before releasing aggregates;
+a quiet source can therefore delay an aggregate. Batch mode emits complete batches
+without that extra block wait. If the hot cache evicts part of a block, aggregates
+from that boundary block are conservatively omitted; raw constituents may still
+be retrieved from disk. Retained snapshots remain partial history, never a claim
+of full historical coverage.
 
 ## Performance and isolation
 
-The book listener enqueues raw records before market filtering. With no allowlist
-there is no extra wallet parse/journal work. With wallets enabled, a dedicated
-thread parses envelopes, skips unselected payloads using borrowed raw JSON, and
-stores only selected events. Input is capped at 64 records and 16 MiB; one wallet
-event is capped at 64 KiB. The hot enqueue uses atomics and a nonblocking bounded
-queue. Overflow marks a wallet gap instead of waiting behind the worker. Journal
-I/O runs outside shared state locks and outside the book listener. There is still
-additional copying, parsing CPU and bounded journal I/O when enabled; production
-cost must be measured with realistic node traffic.
+Wallets use a dedicated file-reader thread, independent of the book listener. With
+no allowlist, no wallet files/database are opened. With wallets enabled, the worker
+parses borrowed raw envelopes, skips unselected payloads, and stores only selected
+events. Each pass reads at most 128 records or approximately 1 MiB per source
+(a single record can be up to 16 MiB), then yields for the configured poll interval.
+File discovery runs once per second; rotation can add up to that discovery delay.
+Disk writes run outside shared state locks. Wallet recovery does not request full
+book snapshots or invalidate an otherwise healthy book.
 
-No full-book snapshot is requested by wallet initialization, polling or journal
-persistence. Book recovery may conservatively invalidate wallet continuity, but
-wallet-only worker errors do not trigger book snapshots or close the WS connection.
-Slow Info requests are asynchronous; disconnection cancels connection-owned jobs.
-The shared cache prevents duplicate clients multiplying successful polling rates.
+This adds node-file reads, parsing CPU and SQLite I/O. Measure the production cost;
+local mock tests do not establish a production latency improvement. Event-triggered
+HTTP work runs asynchronously, uses shared single-flight caches, and only occurs
+for active openOrders subscriptions. Additional clients do not multiply successful
+query rates. Stale/error queries are retried with the configured minimum interval.
 
-`/diagnostics.wallet` reports configured wallet count, retained/queued bytes,
-source heights/times and bounded queue-wait/decode/persist/open-orders-query timing samples.
-Raw balances/history are not returned by that diagnostics endpoint.
+`/diagnostics.wallet` reports source heights/times, coverage start, replay state,
+gaps, journal errors, hot-cache size and decode/persist/open-order query timings.
+Raw wallet history is not exposed by diagnostics. Existing market-data diagnostics
+remain available for before/after comparisons.
 
 ## Build, deployment and verification
 
@@ -191,9 +247,9 @@ References: [official subscriptions](https://hyperliquid.gitbook.io/hyperliquid-
 
 
 Local parser timing fixture (macOS release build, 100 repetitions of a 345099-byte
-batch containing 1000 unselected orders): worker envelope filtering took 38.12 ms
-total, about 0.381 ms per batch. The existing typed book decoder in that fixture
-took 63.49 ms total. Wallet filtering is **additional** work when enabled, not a
+batch containing 1000 unselected orders): worker envelope filtering took 38.73 ms
+total, about 0.387 ms per batch. The existing typed book decoder in that fixture
+took 63.13 ms total. Wallet filtering is **additional** work when enabled, not a
 replacement or claimed mainnet speedup. Actual node traffic and selected-event
 rates can differ substantially; use the added worker metrics after deployment.
 

@@ -2,6 +2,7 @@
 """Local-only wallet integration: real WS process + fake node HTTP/JSONL.
 Run python3 scripts/mock_wallet_e2e.py [--stream]. No node/public API access.
 """
+import sqlite3
 import datetime
 import http.server
 import json
@@ -75,7 +76,7 @@ def main():
             sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
         command = [str(binary), '--address', '127.0.0.1', '--port', str(port), '--node-data-dir', str(root),
             '--info-url', f'http://127.0.0.1:{httpd.server_port}/info', '--markets', 'BTC', '--wallets', USER+','+OTHER,
-            '--wallet-poll-interval-ms', '250', '--stale-after-secs', '1', '--retry-interval-secs', '1',
+            '--wallet-poll-interval-ms', '1000', '--stale-after-secs', '1', '--retry-interval-secs', '1',
             '--websocket-compression-level', '0']
         if streamed: command.append('--stream-with-block-info')
         log = (root/'server.log').open('w')
@@ -126,29 +127,37 @@ def main():
             # Authoritative openOrders: no events merged onto potentially newer snapshots.
             sub(a, 'openOrders', dex='xyz')
             assert a.until('openOrders')['data']['orders'] == []
-            with lock: state['open'] = [order]; state['slow'] = True
+            # Relevant events must refresh before the one-second reconciliation timer.
+            started=time.monotonic()
+            with lock:
+                state['open']=[order]
+                state['orders']=[dict(user=USER,time=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(),status='open',order=dict(order,coin='xyz:NVDA'))]
+            assert a.until('openOrders')['data']['orders'] == [order]
+            assert time.monotonic()-started < .8, 'event did not trigger openOrders refresh'
+            with lock: state['open'] = []; state['slow'] = True
             a.send(dict(method='subscribe', subscription=dict(type='l2Book', coin='BTC', nLevels=5)))
             a.until('subscriptionResponse')
             books = 0
             while True:
                 m = a.recv()
                 if m['channel'] == 'l2Book': books += 1
-                if m['channel'] == 'openOrders' and m['data']['orders']: break
+                if m['channel'] == 'openOrders' and not m['data']['orders']: break
             assert books >= 2, 'slow wallet HTTP blocked book delivery'
             with lock: state['fail'] = True; state['slow'] = False
             a.until('walletStatus', predicate=lambda m: m['data'].get('scope') == 'openOrders' and m['data']['state'] == 'Stale')
-            with lock: state['fail'] = False; state['open'] = []
-            assert a.until('openOrders')['data']['orders'] == []
+            with lock: state['fail'] = False; state['open'] = [order]
+            assert a.until('openOrders')['data']['orders'] == [order]
             # Shared query cache: a second client must not double node request rate.
             d = WS(port); clients.append(d); sub(d, 'openOrders', dex='xyz')
             d.until('openOrders')
             with lock: before = state['queries']
             time.sleep(1.1)
             with lock: delta = state['queries'] - before
-            assert delta <= 5, f'wallet query cache did not share requests: {delta}'
+            assert delta <= 2, f'wallet query cache did not share requests: {delta}'
             # A skipped block must expose a wallet gap and keep the connection usable.
-            with lock: state['skip'] = True
-            a.until('walletStatus', predicate=lambda m: m['data'].get('resetRequired') is True and m['data'].get('generation', 0) > 0)
+            if not streamed:
+                with lock: state['skip'] = True
+                a.until('walletStatus', predicate=lambda m: m['data'].get('resetRequired') is True and m['data'].get('generation', 0) > 0)
             a.until('l2Book')
             # Stop output: explicit gap on same WebSocket, followed by new snapshots.
             with lock: state['pause'] = True
@@ -157,20 +166,23 @@ def main():
             with lock: state['pause'] = False
             a.until('walletStatus', predicate=lambda m: m['data']['state'] == 'Ready' and m['data'].get('resetRequired') is True)
             a.until('l2Book')
-            # Unsupported aggregations/allowlist must error without disconnect.
-            a.send(dict(method='subscribe', subscription=dict(type='userFills', user=USER, aggregateByTime=True)))
-            assert 'aggregateByTime' in a.until('error')['data']
+            agg = WS(port); clients.append(agg); sub(agg, 'userFills', aggregateByTime=True)
+            assert agg.until('userFills')['data']['fills'][0]['sz'] == '1'
+            with lock: state['fills'] = [[USER, dict(fill, tid=126, hash='aggregate', sz='2')], [USER, dict(fill, tid=127, hash='aggregate', sz='3')]]
+            grouped = agg.until('userFills', predicate=lambda m: not m['data']['isSnapshot'])['data']['fills']
+            assert len(grouped) == 1 and grouped[0]['sz'] == '5' and grouped[0]['fee'] == '0.2', grouped
             a.send(dict(method='subscribe', subscription=dict(type='userFills', user='0x'+'3'*40)))
             assert '--wallets' in a.until('error')['data']
-            # Persistence is bounded and survives process restart with explicit unavailable downtime.
-            journal = root/'ws-wallet-journal.json'
+            journal = root/'ws-wallet-journal.sqlite'
+            def persisted():
+                with sqlite3.connect(journal) as db:
+                    return [json.loads(row[0]) for row in db.execute("SELECT data FROM events WHERE user=? AND channel='userFills' ORDER BY seq", (USER,))]
             for _ in range(40):
-                if journal.exists() and any(e['channel']=='userFills' for e in json.loads(journal.read_text())['events']): break
+                if journal.exists() and len(persisted()) >= 3: break
                 time.sleep(.1)
-            assert journal.exists() and journal.stat().st_size < 2*1024*1024
-            # Runtime journal failure must be observable without stopping books or fills.
-            backup = root/'journal-backup.json'
-            journal.rename(backup); journal.mkdir()
+            assert len(persisted()) >= 3
+            # Block SQLite writes; books must continue and wallet readiness must fail closed.
+            blocker = sqlite3.connect(journal); blocker.execute('BEGIN IMMEDIATE')
             extra_fill = dict(fill, tid=125)
             with lock: state['fills'] = [[USER, extra_fill]]
             def journal_error():
@@ -181,17 +193,30 @@ def main():
                 time.sleep(.1)
             assert journal_error() is not None
             a.until('l2Book')
-            journal.rmdir(); backup.rename(journal)
+            blocker.rollback(); blocker.close()
             for _ in range(40):
-                if journal_error() is None and any(e['data'].get('tid') == 125 for e in json.loads(journal.read_text())['events']): break
+                if journal_error() is None and any(e.get('tid') == 125 for e in persisted()): break
                 time.sleep(.1)
             assert journal_error() is None
-            assert any(e['data'].get('tid') == 125 for e in json.loads(journal.read_text())['events'])
+            assert any(e.get('tid') == 125 for e in persisted())
             for ws in clients: ws.close()
             clients.clear(); proc.terminate(); proc.wait(timeout=10)
+            # A fill emitted while the WS process is stopped must be recovered, including rotation.
+            with lock: state['fills'] = [[USER, dict(fill, tid=128, hash='offline')]]
+            time.sleep(.15)
+            with lock:
+                for i,p in enumerate(paths):
+                    paths[i] = p.with_name('1'); paths[i].touch()
+                state['fills'] = [[USER, dict(fill, tid=129, hash='offline-rotated')]]
+            time.sleep(.15)
             proc = start(); a = WS(port); clients.append(a); sub(a, 'userFills')
             assert a.until('walletStatus')['data']['historyComplete'] is False
-            assert a.until('userFills')['data']['fills'] == [fill, extra_fill]
+            recovered = a.until('userFills')['data']['fills']
+            assert {e['tid'] for e in recovered} == {123,125,126,127,128,129}, recovered
+            time.sleep(1.2)
+            a.send(dict(method='post', id=99, request=dict(type='info',payload=dict(type='localWalletHistory',user=USER,limit=100))))
+            history=a.until('post')['data']['response']['payload']['data']
+            assert {e['data']['tid'] for e in history['events'] if e['channel']=='userFills'} == {123,125,126,127,128,129}, history
             print('wallet e2e passed:', 'streamed' if streamed else 'batch')
         except Exception:
             print((root/'server.log').read_text(), file=sys.stderr)

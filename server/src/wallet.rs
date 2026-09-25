@@ -1,16 +1,14 @@
-//! Local-only wallet journal. Raw node records are tapped before market filtering.
+//! Local-only wallet journal with independent, resumable node-file readers.
 //! Parsing and persistence run on a dedicated worker, never under the book lock.
+mod aggregate;
+mod storage;
 use crate::ServerConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, value::RawValue};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc,
-    },
+    sync::{Arc, Mutex, atomic::Ordering},
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
@@ -70,6 +68,8 @@ struct Event {
     data: Value,
     key: String,
     bytes: usize,
+    #[serde(default)]
+    height: u64,
 }
 #[derive(Default)]
 struct Source {
@@ -90,6 +90,12 @@ struct State {
     reason: String,
     journal_error: Option<String>,
     gaps: u64,
+    pending: Vec<Event>,
+    coverage_start: i64,
+    replaying: bool,
+    dirty: HashMap<(String, String), u64>,
+    source_height: u64,
+    aggregation_floor: HashMap<String, u64>,
 }
 #[derive(Serialize, Deserialize)]
 struct Journal {
@@ -109,9 +115,15 @@ impl State {
             bytes: 0,
             sources: [Source::default(), Source::default()],
             ready: false,
-            reason: "startup: history before collection and downtime are unavailable".into(),
+            reason: "startup: loading retained history and resuming input cursors".into(),
             journal_error: None,
             gaps: 0,
+            pending: Vec::new(),
+            coverage_start: chrono::Utc::now().timestamp_millis(),
+            replaying: true,
+            dirty: HashMap::new(),
+            source_height: 0,
+            aggregation_floor: HashMap::new(),
         }
     }
     fn gap(&mut self, reason: String) {
@@ -128,9 +140,21 @@ impl State {
         self.seq += 1;
         let bytes = data.to_string().len() + key.len() + user.len() + 128;
         self.bytes += bytes;
-        self.events.push_back(Event { seq: self.seq, user, channel: channel.into(), data, key, bytes });
+        let coin = data["coin"].as_str().or_else(|| data["order"]["coin"].as_str()).unwrap_or("");
+        let dex = coin.split_once(':').map_or("", |x| x.0).to_string();
+        self.dirty.insert((user.clone(), dex), self.seq);
+        let event =
+            Event { seq: self.seq, user, channel: channel.into(), data, key, bytes, height: self.source_height };
+        self.pending.push(event.clone());
+        self.events.push_back(event);
         while self.events.len() > MAX_EVENTS || self.bytes > MAX_BYTES {
             if let Some(e) = self.events.pop_front() {
+                if e.channel == "userFills" {
+                    self.aggregation_floor
+                        .entry(e.user.clone())
+                        .and_modify(|h| *h = (*h).max(e.height))
+                        .or_insert(e.height);
+                }
                 self.bytes -= e.bytes;
                 self.keys.remove(&e.key);
                 self.removed_through = e.seq;
@@ -140,157 +164,134 @@ impl State {
     fn status(&self) -> Value {
         json!({"source":"localNode","state":if self.ready {"Ready"} else {"Stale"},
             "generation":self.epoch,"reason":self.reason,"gaps":self.gaps,"sessionStartedAt":self.session_started_at,
-            "historyComplete":false,"historyScope":"bounded local observations; pre-collection and downtime events unavailable",
+            "historyComplete":false,"historyScope":"retained local observations; see localWalletHistory for disk history and gaps",
+            "coverageStartTime":self.coverage_start,"replaying":self.replaying,
             "oldestRetainedSequence":self.events.front().map(|e|e.seq),"latestSequence":self.seq,
             "retainedEvents":self.events.len(),"retainedBytes":self.bytes,"journalError":self.journal_error,
             "orderHeight":self.sources[0].height,"fillHeight":self.sources[1].height,
             "orderTime":self.sources[0].block_time,"fillTime":self.sources[1].block_time})
     }
 }
-struct Input {
-    enqueued: Instant,
-    source: usize,
-    line: String,
-    epoch: u64,
-}
 #[derive(Default)]
 struct OrdersCache {
     epoch: u64,
     fetched: Option<Instant>,
     response: Value,
+    dirty: u64,
 }
 type OrderCaches = Arc<Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<OrdersCache>>>>>;
 #[derive(Clone)]
 pub(crate) struct WalletHub {
     state: Arc<Mutex<State>>,
     allowed: Arc<HashSet<String>>,
-    tx: Option<mpsc::SyncSender<Input>>,
-    queued: Arc<AtomicUsize>,
-    epoch: Arc<AtomicU64>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    db_path: PathBuf,
+    streamed: bool,
     metrics: Arc<crate::telemetry::Metrics>,
     order_caches: OrderCaches,
     signal: watch::Sender<u64>,
     pub(crate) poll_interval: Duration,
+    pub(crate) event_interval: Duration,
 }
 impl WalletHub {
     pub(crate) fn new(config: &ServerConfig) -> crate::Result<Self> {
         let allowed: HashSet<_> = config.wallets.iter().map(|w| w.to_ascii_lowercase()).collect();
-        let path = config.wallet_journal_path.clone().unwrap_or_else(|| config.data_dir.join("ws-wallet-journal.json"));
+        let legacy =
+            config.wallet_journal_path.clone().unwrap_or_else(|| config.data_dir.join("ws-wallet-journal.json"));
+        let path = if legacy.extension().is_some_and(|s| s == "json") {
+            legacy.with_extension("sqlite")
+        } else {
+            legacy.clone()
+        };
+        if path == config.snapshot_path {
+            return Err("wallet database and book snapshot paths must differ".into());
+        }
         let mut state = State::new();
-        if !allowed.is_empty() && path.exists() {
-            if std::fs::metadata(&path)?.len() > (MAX_BYTES * 3) as u64 {
-                return Err("wallet journal exceeds size limit".into());
+        let mut store = None;
+        let mut checkpoints: [storage::Checkpoint; 2] = Default::default();
+        let mut gaps = Vec::new();
+        if !allowed.is_empty() {
+            std::fs::create_dir_all(path.parent().ok_or("wallet database needs parent directory")?)?;
+            let db = storage::Store::open(&path)?;
+            checkpoints = db.meta("checkpoints")?.unwrap_or_default();
+            let saved_seq = db.meta("seq")?;
+            state.seq = saved_seq.unwrap_or_default();
+            if saved_seq.is_some() && checkpoints.iter().any(|c| c.cursor.is_none()) {
+                gaps.push("restart without a persisted source-file cursor; resumed at a fresh live boundary".into());
             }
-            let journal: Journal = serde_json::from_slice(&std::fs::read(&path)?)?;
-            if journal.schema != 1 {
-                return Err("unsupported wallet journal schema".into());
-            }
-            let mut previous = 0;
-            for e in &journal.events {
-                if e.seq <= previous
-                    || e.seq > journal.seq
-                    || !valid_address(&e.user)
-                    || !["userFills", "orderUpdates"].contains(&e.channel.as_str())
-                    || e.data.to_string().len() > MAX_EVENT_BYTES
-                {
-                    return Err("invalid wallet journal".into());
-                }
-                previous = e.seq;
-            }
-            // Re-sequence retained observations; every restart explicitly opens a new gap.
-            for e in journal.events {
-                if allowed.contains(&e.user) {
-                    state.push(e.user, &e.channel, e.data, e.key);
+            state.gaps = db.meta("gap_count")?.unwrap_or_default();
+            state.coverage_start = db.meta("coverage")?.unwrap_or(state.coverage_start);
+            if let Some(old) = db.meta::<HashSet<String>>("wallets")? {
+                if old != allowed {
+                    gaps.push("wallet allowlist changed; older events for new wallets were not indexed".into());
                 }
             }
+            for event in db.recent()? {
+                if allowed.contains(&event.user) {
+                    state.bytes += event.bytes;
+                    state.keys.insert(event.key.clone());
+                    state.events.push_back(event);
+                }
+            }
+            while state.bytes > MAX_BYTES {
+                if let Some(e) = state.events.pop_front() {
+                    state.bytes -= e.bytes;
+                    state.keys.remove(&e.key);
+                } else {
+                    break;
+                }
+            }
+            state.removed_through = state.events.front().map_or(state.seq, |e| e.seq.saturating_sub(1));
+            if state.removed_through > 0 {
+                for e in &state.events {
+                    if e.channel == "userFills" {
+                        state.aggregation_floor.entry(e.user.clone()).or_insert(e.height);
+                    }
+                }
+            }
+            if state.seq == 0 && legacy != path && legacy.exists() {
+                if std::fs::metadata(&legacy)?.len() > 6 * 1024 * 1024 {
+                    return Err("legacy wallet journal exceeds limit".into());
+                }
+                let journal: Journal = serde_json::from_slice(&std::fs::read(&legacy)?)?;
+                if journal.schema != 1 {
+                    return Err("unsupported legacy wallet journal".into());
+                }
+                for e in journal.events {
+                    if allowed.contains(&e.user) {
+                        state.push(e.user, &e.channel, e.data, e.key);
+                    }
+                }
+                gaps.push("imported legacy wallet journal; pre-migration source cursors unavailable".into());
+            }
+            for (source, checkpoint) in state.sources.iter_mut().zip(&checkpoints) {
+                source.height = checkpoint.height;
+                source.block_time = checkpoint.time;
+            }
+            store = Some(db);
         }
         let (signal, _) = watch::channel(0);
         let state = Arc::new(Mutex::new(state));
-        let queued = Arc::new(AtomicUsize::new(0));
         let allowed = Arc::new(allowed);
-        let epoch = Arc::new(AtomicU64::new(0));
         let metrics = Arc::new(crate::telemetry::Metrics::default());
-        let mut hub = Self {
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(!allowed.is_empty()));
+        let hub = Self {
             state: state.clone(),
             allowed: allowed.clone(),
-            tx: None,
-            queued: queued.clone(),
-            epoch: epoch.clone(),
+            running: running.clone(),
+            db_path: path,
+            streamed: config.stream_with_block_info,
             metrics: metrics.clone(),
             order_caches: Arc::new(Mutex::new(HashMap::new())),
             signal: signal.clone(),
             poll_interval: config.wallet_poll_interval,
+            event_interval: config.wallet_event_interval,
         };
-        if !allowed.is_empty() {
-            let parent = path.parent().ok_or("wallet journal needs a parent directory")?;
-            std::fs::create_dir_all(parent)?;
-            // Keep the journal separate from the large node snapshot.
-            if path == config.snapshot_path {
-                return Err("wallet journal and snapshot paths must differ".into());
-            }
-            let (tx, rx) = mpsc::sync_channel::<Input>(64);
-            hub.tx = Some(tx);
-            let streamed = config.stream_with_block_info;
-            let stale = config.stale_after;
-            std::thread::Builder::new().name("wallet-journal".into()).spawn(move || {
-                let mut persisted = 0;
-                let mut last_save = Instant::now();
-                loop {
-                    match rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(input) => {
-                            queued.fetch_sub(input.line.len(), Ordering::Relaxed);
-                            metrics.elapsed("queue_wait_us", input.enqueued);
-                            let decode_start = Instant::now();
-                            let decoded = decode(input.source, &input.line, &allowed);
-                            metrics.elapsed("decode_us", decode_start);
-                            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-                            if s.epoch == input.epoch {
-                                match decoded.and_then(|batch| apply(&mut s, input.source, batch, streamed, stale)) {
-                                    Ok(changed) => {
-                                        if changed {
-                                            signal.send_modify(|n| *n += 1);
-                                        }
-                                    }
-                                    Err(reason) => {
-                                        log::warn!("wallet gap: {reason}");
-                                        s.gap(reason);
-                                        epoch.store(s.epoch, Ordering::Release);
-                                        signal.send_modify(|n| *n += 1);
-                                    }
-                                }
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-                    if s.ready && s.sources.iter().any(|x| x.seen.is_none_or(|t| t.elapsed() > stale)) {
-                        s.gap("upstream wallet stream stopped progressing".into());
-                        epoch.store(s.epoch, Ordering::Release);
-                        signal.send_modify(|n| *n += 1);
-                    }
-                    if last_save.elapsed() >= Duration::from_secs(1) && s.seq != persisted {
-                        let seq = s.seq;
-                        let journal = Journal { schema: 1, seq, events: s.events.clone() };
-                        drop(s);
-                        let persist_start = Instant::now();
-                        let result = save(&path, &journal);
-                        metrics.elapsed("persist_us", persist_start);
-                        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-                        let error = result.err().map(|e| e.to_string());
-                        if error != s.journal_error {
-                            if error.is_some() {
-                                log::warn!("wallet journal write failed: {error:?}");
-                            }
-                            s.journal_error = error.clone();
-                            signal.send_modify(|n| *n += 1);
-                        }
-                        if error.is_none() {
-                            persisted = seq;
-                        }
-                        last_save = Instant::now();
-                    }
-                }
+        if let Some(store) = store {
+            let config = config.clone();
+            let weak = Arc::downgrade(&running);
+            std::thread::Builder::new().name("wallet-reader".into()).spawn(move || {
+                run_worker(config, state, allowed, metrics, signal, weak, store, checkpoints, gaps);
             })?;
         }
         Ok(hub)
@@ -312,9 +313,17 @@ impl WalletHub {
             caches.entry(key).or_default().clone()
         };
         let mut cache = cache.lock().await;
-        if cache.epoch == epoch && cache.fetched.is_some_and(|t| t.elapsed() < self.poll_interval) {
+        if cache.response["type"] == "info"
+            && cache.epoch == epoch
+            && cache.dirty == self.dirty_version(&user, &dex)
+            && cache.fetched.is_some_and(|t| t.elapsed() < self.poll_interval)
+        {
             return cache.response.clone();
         }
+        if let Some(t) = cache.fetched {
+            tokio::time::sleep(self.event_interval.saturating_sub(t.elapsed())).await;
+        }
+        let dirty = self.dirty_version(&user, &dex);
         let start = Instant::now();
         let response = bridge
             .execute(crate::servers::info::PostRequest {
@@ -325,13 +334,34 @@ impl WalletHub {
             .await
             .response;
         self.metrics.elapsed("open_orders_query_us", start);
+        cache.dirty = dirty;
         cache.epoch = epoch;
         cache.fetched = Some(Instant::now());
         cache.response = response.clone();
         response
     }
+    pub(crate) fn dirty_version(&self, user: &str, dex: &str) -> u64 {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()).dirty.get(&(user.into(), dex.into())).unwrap_or(&0)
+    }
+    pub(crate) async fn history(&self, payload: Value) -> Result<Value, String> {
+        let user = payload["user"].as_str().ok_or("missing user")?.to_ascii_lowercase();
+        if !self.allowed.contains(&user) {
+            return Err("wallet not configured".into());
+        }
+        let after = payload.get("afterSequence").map_or(Ok(0), |v| v.as_u64().ok_or("invalid afterSequence"))?;
+        let limit = payload.get("limit").map_or(Ok(100), |v| v.as_u64().ok_or("invalid limit"))?;
+        if limit == 0 || limit > 1000 || after > i64::MAX as u64 {
+            return Err("limit must be 1..1000; sequence must fit signed 64 bits".into());
+        }
+        let path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            storage::history(&path, &user, after, limit as usize).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
     pub(crate) fn enabled(&self) -> bool {
-        self.tx.is_some()
+        self.running.load(Ordering::Relaxed)
     }
     pub(crate) fn subscribe_signal(&self) -> watch::Receiver<u64> {
         self.signal.subscribe()
@@ -340,9 +370,6 @@ impl WalletHub {
         if !self.allowed.contains(sub.user()) {
             return Err("wallet not enabled; configure --wallets with this address".into());
         }
-        if matches!(sub, WalletSubscription::UserFills { aggregate_by_time: true, .. }) {
-            return Err("aggregateByTime=true is not supported locally; use false or omit it".into());
-        }
         if let WalletSubscription::OpenOrders { dex, .. } = sub {
             if dex.len() > 64 || !dex.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
                 return Err("invalid dex name".into());
@@ -350,45 +377,11 @@ impl WalletHub {
         }
         Ok(())
     }
-    pub(crate) fn tap(&self, source: usize, line: &str) {
-        let Some(tx) = &self.tx else { return };
-        let source = match source {
-            0 => 0,
-            2 => 1,
-            _ => return,
-        };
-        let old = self.queued.fetch_add(line.len(), Ordering::Relaxed);
-        if old.saturating_add(line.len()) > INPUT_BYTES {
-            self.queued.fetch_sub(line.len(), Ordering::Relaxed);
-            self.gap("wallet input byte limit exceeded");
-            return;
-        }
-        let epoch = self.epoch.load(Ordering::Acquire);
-        if let Err(e) = tx.try_send(Input { enqueued: Instant::now(), source, line: line.into(), epoch }) {
-            let input = match e {
-                mpsc::TrySendError::Full(i) | mpsc::TrySendError::Disconnected(i) => i,
-            };
-            self.queued.fetch_sub(input.line.len(), Ordering::Relaxed);
-            self.gap("wallet worker queue unavailable");
-        }
-    }
-    pub(crate) fn gap(&self, reason: &str) {
-        if !self.enabled() {
-            return;
-        }
-        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !s.ready && s.reason == reason {
-            return;
-        }
-        s.gap(reason.into());
-        self.epoch.store(s.epoch, Ordering::Release);
-        self.signal.send_modify(|n| *n += 1);
-    }
     pub(crate) fn status(&self) -> Value {
         let mut status = self.state.lock().unwrap_or_else(|e| e.into_inner()).status();
         status["enabled"] = json!(self.enabled());
         status["configuredWallets"] = json!(self.allowed.len());
-        status["queuedBytes"] = json!(self.queued.load(Ordering::Relaxed));
+        status["storage"] = json!("SQLite WAL with transactional source cursors");
         status["metrics"] = self.metrics.snapshot();
         status
     }
@@ -404,6 +397,16 @@ impl WalletHub {
         status["user"] = json!(sub.user());
         status["subscription"] = serde_json::to_value(sub).unwrap_or_default();
         status["resetRequired"] = json!(reset);
+        let aggregated = matches!(sub, WalletSubscription::UserFills { aggregate_by_time: true, .. });
+        let complete = s.sources[1].height.unwrap_or(0).saturating_sub(u64::from(self.streamed));
+        let next_seq = if aggregated {
+            s.events
+                .iter()
+                .find(|e| e.user == sub.user() && e.channel == "userFills" && e.height > complete)
+                .map_or(s.seq, |e| e.seq.saturating_sub(1))
+        } else {
+            s.seq
+        };
         let messages = if !s.ready {
             Vec::new()
         } else if sub.channel() == "userFills" {
@@ -417,6 +420,35 @@ impl WalletHub {
                 })
                 .map(|e| e.data.clone())
                 .collect();
+            let events = if aggregated
+                && !reset
+                && !s.events.iter().any(|e| {
+                    e.user == sub.user()
+                        && e.channel == "userFills"
+                        && e.height <= complete
+                        && cursor.is_some_and(|(_, seq)| e.seq > seq)
+                }) {
+                vec![]
+            } else if aggregated {
+                match aggregate::fills(
+                    s.events.iter().filter(|e| {
+                        e.user == sub.user()
+                            && e.channel == "userFills"
+                            && s.aggregation_floor.get(&e.user).is_none_or(|floor| e.height > *floor)
+                    }),
+                    if reset { None } else { cursor.map(|(_, seq)| seq) },
+                    complete,
+                ) {
+                    Ok(events) => events,
+                    Err(reason) => {
+                        status["state"] = json!("Stale");
+                        status["reason"] = json!(reason);
+                        return (status, vec![], cursor.unwrap_or((s.epoch, 0)), true);
+                    }
+                }
+            } else {
+                events
+            };
             if reset || !events.is_empty() {
                 vec![json!({"channel":"userFills","data":{"user":sub.user(),"isSnapshot":reset,"fills":events}})]
             } else {
@@ -435,9 +467,213 @@ impl WalletHub {
         } else {
             vec![]
         };
-        (status, messages, (s.epoch, s.seq), reset)
+        (status, messages, (s.epoch, next_seq), reset)
     }
 }
+fn run_worker(
+    config: ServerConfig,
+    state: Arc<Mutex<State>>,
+    allowed: Arc<HashSet<String>>,
+    metrics: Arc<crate::telemetry::Metrics>,
+    signal: watch::Sender<u64>,
+    running: std::sync::Weak<std::sync::atomic::AtomicBool>,
+    mut store: storage::Store,
+    mut checkpoints: [storage::Checkpoint; 2],
+    mut gaps: Vec<String>,
+) {
+    let dirs = [
+        config.order_status_dir.clone().unwrap_or_else(|| config.data_dir.join("node_order_statuses_by_block")),
+        config.fills_dir.clone().unwrap_or_else(|| config.data_dir.join("node_fills_by_block")),
+    ];
+    let mut readers: [Option<storage::Reader>; 2] = [None, None];
+    for i in 0..2 {
+        match storage::Reader::open(dirs[i].clone(), checkpoints[i].cursor.clone()) {
+            Ok(reader) => {
+                checkpoints[i].cursor = reader.cursor.clone();
+                readers[i] = Some(reader)
+            }
+            Err(e) => {
+                gaps.push(format!("wallet source {i} cannot resume retained file: {e}"));
+                checkpoints[i] = Default::default();
+                state.lock().unwrap_or_else(|e| e.into_inner()).sources[i] = Source::default();
+                readers[i] = storage::Reader::open(dirs[i].clone(), None).ok();
+            }
+        }
+    }
+    if !gaps.is_empty() {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.gaps += gaps.len() as u64;
+        s.reason = gaps.join("; ");
+    }
+    // Establish the initial EOF anchors before publishing any live record. A crash
+    // before the next checkpoint can then replay those records from these anchors.
+    let (pending, seq, coverage) = {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        (std::mem::take(&mut s.pending), s.seq, s.coverage_start)
+    };
+    let initial = store.commit(&pending, &checkpoints, seq, &gaps, &config, coverage);
+    let mut persistence_failed = initial.is_err();
+    match initial {
+        Ok(()) => gaps.clear(),
+        Err(error) => {
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.pending = pending;
+            s.journal_error = Some(error.to_string());
+            s.reason = "initial wallet checkpoint blocked; retrying before ingestion".into();
+        }
+    }
+    let mut last_commit = Instant::now();
+    let mut last_discovery = Instant::now();
+    let mut at_tip = [false; 2];
+    loop {
+        if running.upgrade().is_none() {
+            break;
+        }
+        if !persistence_failed {
+            for i in 0..2 {
+                if readers[i].is_none() && last_discovery.elapsed() >= Duration::from_secs(1) {
+                    readers[i] = storage::Reader::open(dirs[i].clone(), None).ok();
+                }
+                let Some(reader) = readers[i].as_mut() else {
+                    at_tip[i] = false;
+                    continue;
+                };
+                let mut bytes = 0;
+                at_tip[i] = false;
+                for _ in 0..128 {
+                    let line = match reader.next() {
+                        Ok(Some(line)) => line,
+                        Ok(None) => {
+                            checkpoints[i].cursor = reader.cursor.clone();
+                            at_tip[i] = true;
+                            break;
+                        }
+                        Err(error) => {
+                            let reason = format!("wallet source {i} file continuity lost: {error}");
+                            log::warn!("{reason}");
+                            gaps.push(reason.clone());
+                            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                            s.gap(reason);
+                            s.replaying = true;
+                            signal.send_modify(|n| *n += 1);
+                            drop(s);
+                            readers[i] = None;
+                            checkpoints[i] = Default::default();
+                            break;
+                        }
+                    };
+                    bytes += line.len();
+                    checkpoints[i].cursor = reader.cursor.clone();
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let start = Instant::now();
+                    let decoded = decode(i, &line, &allowed);
+                    metrics.elapsed("decode_us", start);
+                    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                    let previous_height = s.sources[i].height;
+                    // Historical records are valid replay inputs. Readiness is decided only after
+                    // both readers reach current output, not by the age of each replayed record.
+                    let was_ready = s.ready;
+                    let was_replaying = s.replaying;
+                    s.replaying = true;
+                    match decoded.and_then(|d| apply(&mut s, i, d, config.stream_with_block_info, config.stale_after)) {
+                        Ok(changed) => {
+                            s.ready = was_ready;
+                            s.replaying = was_replaying;
+                            checkpoints[i].height = s.sources[i].height;
+                            checkpoints[i].time = s.sources[i].block_time;
+                            if changed || (i == 1 && previous_height != s.sources[i].height) {
+                                signal.send_modify(|n| *n += 1);
+                            }
+                        }
+                        Err(reason) => {
+                            log::warn!("wallet gap: {reason}");
+                            gaps.push(reason.clone());
+                            s.gap(reason);
+                            s.replaying = true;
+                            // This record cannot be reconstructed reliably. Its cursor and the gap
+                            // are committed together; never get stuck replaying it forever.
+                            checkpoints[i].height = None;
+                            checkpoints[i].time = None;
+                            signal.send_modify(|n| *n += 1);
+                        }
+                    }
+                    if bytes >= 1024 * 1024 {
+                        break;
+                    }
+                }
+            }
+        }
+        if last_discovery.elapsed() >= Duration::from_secs(1) {
+            last_discovery = Instant::now();
+        }
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        let ready = !persistence_failed
+            && at_tip.iter().all(|v| *v)
+            && s.sources.iter().all(|source| {
+                source.block_time.is_some_and(|t| {
+                    chrono::Utc::now().timestamp_millis().saturating_sub(t) <= config.stale_after.as_millis() as i64
+                })
+            });
+        if ready != s.ready || (ready && s.replaying) {
+            if s.ready && !ready {
+                s.epoch += 1;
+            }
+            s.ready = ready;
+            s.replaying = !ready;
+            s.reason = if ready {
+                "retained source replay caught up; live local streams ready"
+            } else {
+                "wallet replay or stale upstream; publishing paused"
+            }
+            .into();
+            signal.send_modify(|n| *n += 1);
+        }
+        if last_commit.elapsed() >= Duration::from_secs(1) || (!persistence_failed && s.pending.len() >= 256) {
+            let pending = std::mem::take(&mut s.pending);
+            let seq = s.seq;
+            let coverage = s.coverage_start;
+            drop(s);
+            let start = Instant::now();
+            let result = store.commit(&pending, &checkpoints, seq, &gaps, &config, coverage);
+            metrics.elapsed("persist_us", start);
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            match result {
+                Ok(()) => {
+                    if s.journal_error.take().is_some() {
+                        signal.send_modify(|n| *n += 1);
+                    }
+                    persistence_failed = false;
+                    gaps.clear();
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    if s.journal_error.as_ref() != Some(&reason) {
+                        log::warn!("wallet transaction failed: {reason}");
+                        signal.send_modify(|n| *n += 1);
+                    }
+                    s.pending = pending;
+                    s.journal_error = Some(reason);
+                    if s.ready {
+                        s.epoch += 1;
+                    }
+                    s.ready = false;
+                    s.reason = "wallet persistence blocked; source cursors retained for retry".into();
+                    persistence_failed = true;
+                }
+            }
+            last_commit = Instant::now();
+        } else {
+            drop(s);
+        }
+        std::thread::sleep(config.poll_interval);
+    }
+    // Graceful worker teardown when used by tests/embedders. Abrupt process exits
+    // recover uncommitted records from the last transactional cursor instead.
+}
+
+#[cfg(test)]
 fn save(path: &PathBuf, journal: &Journal) -> crate::Result<()> {
     use std::io::Write;
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
@@ -563,21 +799,30 @@ fn apply(s: &mut State, source: usize, batch: Decoded, streamed: bool, stale: Du
     let previous = &s.sources[source];
     if let Some(h) = previous.height {
         if batch.height < h
-            || (!streamed && batch.height != h + 1)
+            || (!streamed && h.checked_add(1) != Some(batch.height))
             || (batch.height == h && previous.block_time != Some(batch.time))
         {
             return Err(format!("wallet source {source} discontinuity: previous {h}, received {}", batch.height));
         }
     }
-    if chrono::Utc::now().timestamp_millis().saturating_sub(batch.time) > stale.as_millis() as i64 {
+    if !s.replaying
+        && chrono::Utc::now().timestamp_millis().saturating_sub(batch.time)
+            > stale.as_millis().min(i64::MAX as u128) as i64
+    {
         return Err("wallet upstream event time stale".into());
+    }
+    let mut batch_keys = HashMap::new();
+    for (_, _, data, key) in &batch.events {
+        if batch_keys.insert(key, data).is_some_and(|old| old != data)
+            || (s.keys.contains(key) && s.events.iter().any(|e| &e.key == key && &e.data != data))
+        {
+            return Err("conflicting duplicate wallet event".into());
+        }
     }
     s.sources[source] = Source { height: Some(batch.height), block_time: Some(batch.time), seen: Some(Instant::now()) };
     let before = s.seq;
+    s.source_height = batch.height;
     for (user, channel, data, key) in batch.events {
-        if s.keys.contains(&key) && s.events.iter().any(|e| e.key == key && e.data != data) {
-            return Err("conflicting duplicate wallet event".into());
-        }
         s.push(user, channel, data, key);
     }
     let was_ready = s.ready;
@@ -604,13 +849,14 @@ mod tests {
         WalletHub {
             state: Arc::new(Mutex::new(state)),
             allowed: Arc::new(HashSet::from([USER.into()])),
-            tx: None,
-            queued: Arc::new(AtomicUsize::new(0)),
-            epoch: Arc::new(AtomicU64::new(0)),
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            db_path: PathBuf::new(),
+            streamed: false,
             metrics: Arc::new(crate::telemetry::Metrics::default()),
             order_caches: Arc::new(Mutex::new(HashMap::new())),
             signal,
             poll_interval: Duration::from_secs(1),
+            event_interval: Duration::from_millis(100),
         }
     }
     #[test]
@@ -725,6 +971,56 @@ mod tests {
         assert_eq!(status["state"], "Stale");
     }
     #[test]
+    fn aggregate_cursor_waits_for_complete_stream_block() {
+        let mut s = State::new();
+        s.ready = true;
+        s.source_height = 10;
+        s.sources[1].height = Some(10);
+        s.push(USER.into(), "userFills", fill(), "a".into());
+        let mut hub = hub(s);
+        hub.streamed = true;
+        let sub = WalletSubscription::UserFills { user: USER.into(), aggregate_by_time: true };
+        let (_, messages, cursor, _) = hub.read(&sub, None);
+        assert_eq!(messages[0]["data"]["fills"], json!([]));
+        assert_eq!(cursor.1, 0);
+        {
+            let mut s = hub.state.lock().unwrap();
+            let mut f = fill();
+            f["tid"] = json!(8);
+            s.push(USER.into(), "userFills", f, "b".into());
+            s.sources[1].height = Some(11);
+        }
+        let (_, messages, cursor, _) = hub.read(&sub, Some(cursor));
+        assert_eq!(messages[0]["data"]["fills"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[0]["data"]["fills"][0]["sz"], "2");
+        assert!(hub.read(&sub, Some(cursor)).1.is_empty());
+    }
+    #[test]
+    fn aggregate_omits_evicted_boundary_and_bad_decimal_fails_closed() {
+        let mut s = State::new();
+        s.ready = true;
+        s.source_height = 10;
+        s.sources[1].height = Some(10);
+        for n in 0..MAX_EVENTS + 1 {
+            s.push(USER.into(), "userFills", fill(), n.to_string());
+        }
+        let hub = hub(s);
+        let sub = WalletSubscription::UserFills { user: USER.into(), aggregate_by_time: true };
+        assert_eq!(hub.read(&sub, None).1[0]["data"]["fills"], json!([]));
+        {
+            let mut s = hub.state.lock().unwrap();
+            s.source_height = 11;
+            s.sources[1].height = Some(11);
+            let mut f = fill();
+            f["px"] = json!("NaN");
+            s.push(USER.into(), "userFills", f, "bad".into());
+        }
+        let (status, messages, _, _) = hub.read(&sub, None);
+        assert_eq!(status["state"], "Stale");
+        assert!(messages.is_empty());
+        assert_eq!(hub.status()["state"], "Ready"); // raw wallet/book state unaffected
+    }
+    #[test]
     fn journal_roundtrip_restart_and_corruption() {
         let root = std::env::temp_dir().join(format!("wallet-journal-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -741,20 +1037,21 @@ mod tests {
         let hub = WalletHub::new(&config).unwrap();
         assert_eq!(hub.status()["retainedEvents"], 1);
         assert_eq!(hub.status()["state"], "Stale");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while storage::Store::open(&path.with_extension("sqlite")).unwrap().meta::<u64>("seq").unwrap() != Some(1) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
         drop(hub);
+        std::thread::sleep(Duration::from_millis(30));
+        // Migration is once only: the completed SQLite store supersedes legacy JSON.
         std::fs::write(&path, "broken").unwrap();
+        let hub = WalletHub::new(&config).unwrap();
+        drop(hub);
+        std::thread::sleep(Duration::from_millis(30));
+        std::fs::write(path.with_extension("sqlite"), "broken database").unwrap();
         assert!(WalletHub::new(&config).is_err());
         std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn queue_overflow_never_blocks_and_signals_gap() {
-        let mut hub = hub(State::new());
-        let (tx, _rx) = mpsc::sync_channel(1);
-        hub.tx = Some(tx);
-        hub.tap(0, "first");
-        hub.tap(0, "second");
-        assert_eq!(hub.status()["gaps"], 1);
-        assert_eq!(hub.queued.load(Ordering::Relaxed), 5);
     }
 }
 

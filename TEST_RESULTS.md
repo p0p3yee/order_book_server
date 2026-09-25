@@ -119,3 +119,32 @@ these do not retroactively change the original local-only test scope above.
   is claimed. The daemon running on the user's node was not modified or restarted.
 * History remains bounded/partial with explicit gaps; openOrders is authoritative
   polling, not a per-event replica of the public subscription implementation.
+
+
+## Durable local wallet history, event refresh and aggregation
+
+* `cargo fmt --check`, `git diff --check`, `cargo test --locked` and the native
+  `cargo build --locked --release --bin websocket_server` passed: 60 unit tests,
+  two manual performance fixtures ignored by the normal test run.
+* SQLite tests cover transactional event/cursor rollback, conflicting retained
+  identities, event retention, paginated history, partial records, resume anchors,
+  file rotation, truncation/missing files, legacy import and corrupt startup data.
+* Aggregation tests cover taker/maker grouping boundaries, exact summed amounts,
+  weighted prices, optional fees, scientific decimals, malformed amounts, streamed
+  completion/cursor handling and omission of evicted partial boundary groups.
+* Both batch and streamed wallet process tests passed with actual local WS sockets:
+  event-triggered authoritative openOrders refresh before reconciliation, shared
+  query caching, slow/failed HTTP without blocking books, aggregated fills, disk
+  write-lock failure/recovery, offline fills across restart/file rotation, and
+  localWalletHistory queries. No production node or public wallet API was used.
+* Both existing market-book process tests passed: malformed fills, missed blocks,
+  stale output, rotation, HTTP failures, validated resync on the same socket/process,
+  L4 reset and absence of recurring healthy-state full snapshots.
+* Parser fixture: 100 x 345099-byte / 1000-unselected-order batches took 38.73 ms
+  on the wallet worker versus 63.13 ms for the existing typed book decoder. This
+  measures parser CPU only; SQLite, filesystem replay and real traffic need a
+  production comparison. Wallet work is additional CPU/I/O, not a claimed speedup.
+* Docker/Compose defaults and deployment-script tuning were updated; shell syntax
+  checked. A Linux Docker build and deployment have not been performed here.
+* Exact public aggregate metadata/rounding parity remains unverified. Missing or
+  pruned node output cannot be recreated locally; history reports that limitation.

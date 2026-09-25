@@ -26,7 +26,10 @@ docker run -d \
   --init --network host --restart unless-stopped \
   --log-driver json-file --log-opt max-size=20m --log-opt max-file=3 \
   -e "WS_WALLETS=$WS_WALLETS" \
-  -e "WS_WALLET_POLL_INTERVAL_MS=${WS_WALLET_POLL_INTERVAL_MS:-1000}" \
+  -e "WS_WALLET_POLL_INTERVAL_MS=${WS_WALLET_POLL_INTERVAL_MS:-30000}" \
+  -e "WS_WALLET_EVENT_INTERVAL_MS=${WS_WALLET_EVENT_INTERVAL_MS:-100}" \
+  -e "WS_WALLET_HISTORY_EVENTS=${WS_WALLET_HISTORY_EVENTS:-100000}" \
+  -e "WS_WALLET_HISTORY_DAYS=${WS_WALLET_HISTORY_DAYS:-7}" \
   -v /path/to/node-data:/node-data \
   "$image" \
   --address 0.0.0.0 --port 8000 \

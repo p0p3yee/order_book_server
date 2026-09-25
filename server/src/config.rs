@@ -15,6 +15,9 @@ pub struct ServerConfig {
     pub wallets: HashSet<String>,
     pub wallet_journal_path: Option<PathBuf>,
     pub wallet_poll_interval: Duration,
+    pub wallet_event_interval: Duration,
+    pub wallet_history_events: usize,
+    pub wallet_history_days: u32,
     pub stream_with_block_info: bool,
     pub stale_after: Duration,
     pub poll_interval: Duration,
@@ -39,7 +42,10 @@ impl Default for ServerConfig {
             markets: HashSet::new(),
             wallets: HashSet::new(),
             wallet_journal_path: None,
-            wallet_poll_interval: Duration::from_secs(1),
+            wallet_poll_interval: Duration::from_secs(30),
+            wallet_event_interval: Duration::from_millis(100),
+            wallet_history_events: 100_000,
+            wallet_history_days: 7,
             stream_with_block_info: false,
             poll_interval: Duration::from_millis(5),
             stale_after: Duration::from_secs(5),
@@ -60,6 +66,14 @@ impl ServerConfig {
         }
         if self.wallet_poll_interval < Duration::from_millis(250) {
             return Err("wallet polling interval must be at least 250 ms".into());
+        }
+        if self.wallet_event_interval < Duration::from_millis(10)
+            || self.wallet_history_events < 2000
+            || self.wallet_history_events > 1_000_000
+            || self.wallet_history_days == 0
+            || self.wallet_history_days > 3650
+        {
+            return Err("invalid wallet event interval or retention limits".into());
         }
         if !self.data_dir.is_dir() {
             return Err("node data directory does not exist".into());
