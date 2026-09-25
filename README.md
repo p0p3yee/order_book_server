@@ -42,6 +42,10 @@ wallet API limitations, stage timing instrumentation, and host diagnostics comma
 bounded timing samples. Wallet subscriptions and WebSocket Info posts are not
 implemented; use node HTTP Info for supported queries such as `openOrders`.
 
+L2 aggregation follows active market/rounding subscriptions while all configured
+books continue reconstructing and validating. See [PERFORMANCE_FOLLOWUP.md](PERFORMANCE_FOLLOWUP.md)
+for parity tests, the bounded opt-in node profiler, and the unsent upstream report.
+
 ```bash
 cargo fmt --check
 cargo test --locked

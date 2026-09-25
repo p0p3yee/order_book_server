@@ -68,3 +68,16 @@ these do not retroactively change the original local-only test scope above.
 * Instrumented build has not been deployed to the node. No host CPU/disk attribution
   or production instrumentation overhead measurement is claimed.
 * Linux host collector: syntax checked only. Docker Linux image build remains unverified.
+
+## Subscription-aware L2 follow-up
+
+* `cargo test --locked`: 42 passed, 1 ignored manual timing test. The latter was
+  separately run in release mode and passed (see PERFORMANCE_FOLLOWUP.md).
+* Reference-parity fixture: five markets, every supported rounding variant,
+  depth 1/5/20/100/full; demanded outputs equal the old all-variant outputs.
+* Shared demand reference-count test: duplicate updates, unsubscribe, and Drop cleanup pass.
+* Both mock process modes pass recovery and added multi-client subscription replacement.
+* Formatting, diff checks, Python syntax checks and native release build pass.
+* Four collector tests pass, including mocked opt-in profiling selecting the actual
+  hl-node child PID. Actual Linux perf execution and production L2 speedup are unverified.
+* No running node/WS configuration changed; no upstream issue submitted.
