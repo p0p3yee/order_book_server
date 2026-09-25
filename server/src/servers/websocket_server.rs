@@ -1,3 +1,4 @@
+use super::info::{InfoBridge, MAX_PENDING, PostRequest, PostResponse};
 use crate::{
     listeners::order_book::{InternalMessage, L2SnapshotParams, OrderBookListener, TimedSnapshots, hl_listen},
     order_book::{Coin, Snapshot},
@@ -11,7 +12,7 @@ use crate::{
     },
 };
 use axum::{Router, response::IntoResponse, routing::get};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use log::{error, info};
 use std::{
     collections::{HashMap, HashSet},
@@ -34,6 +35,7 @@ pub async fn run_websocket_server(
     config: crate::ServerConfig,
 ) -> Result<()> {
     config.validate()?;
+    let info_bridge = InfoBridge::new(config.info_url.clone())?;
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
 
     // Central task: listen to messages and forward them for distribution
@@ -86,7 +88,14 @@ pub async fn run_websocket_server(
             get({
                 let internal_message_tx = internal_message_tx.clone();
                 async move |ws_upgrade| {
-                    ws_handler(ws_upgrade, internal_message_tx.clone(), listener.clone(), ignore_spot, websocket_opts)
+                    ws_handler(
+                        ws_upgrade,
+                        internal_message_tx.clone(),
+                        listener.clone(),
+                        ignore_spot,
+                        websocket_opts,
+                        info_bridge.clone(),
+                    )
                 }
             }),
         );
@@ -108,6 +117,7 @@ fn ws_handler(
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
     websocket_opts: yawc::Options,
+    info_bridge: InfoBridge,
 ) -> impl IntoResponse {
     let (resp, fut) = match incoming.upgrade(websocket_opts) {
         Ok(upgrade) => upgrade,
@@ -122,7 +132,7 @@ fn ws_handler(
             }
         };
 
-        handle_socket(ws, internal_message_tx, listener, ignore_spot).await
+        handle_socket(ws, internal_message_tx, listener, ignore_spot, info_bridge).await
     });
 
     resp.into_response()
@@ -133,12 +143,13 @@ async fn handle_socket(
     tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
+    info_bridge: InfoBridge,
 ) {
     let metrics = listener.lock().await.metrics.clone();
     SOCKET_TELEMETRY
         .scope(
             SocketTelemetry { metrics, trace: std::cell::RefCell::new(None) },
-            handle_socket_inner(socket, tx, listener, ignore_spot),
+            handle_socket_inner(socket, tx, listener, ignore_spot, info_bridge),
         )
         .await;
 }
@@ -148,7 +159,9 @@ async fn handle_socket_inner(
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     _ignore_spot: bool,
+    info_bridge: InfoBridge,
 ) {
+    let mut info_jobs = FuturesUnordered::<BoxFuture<'static, PostResponse>>::new();
     let mut internal_message_rx = internal_message_tx.subscribe();
     let mut manager = SubscriptionManager::default();
     let mut demand =
@@ -157,6 +170,10 @@ async fn handle_socket_inner(
     send_socket_message(&mut socket, ServerResponse::Status(listener.lock().await.status.clone())).await;
     loop {
         select! {
+            Some(response) = info_jobs.next(), if !info_jobs.is_empty() => {
+                telemetry::dispatch(None);
+                send_socket_message(&mut socket, ServerResponse::Post(response)).await;
+            }
             recv_result = internal_message_rx.recv() => {
                 match recv_result {
                     Ok(msg) => {
@@ -232,6 +249,28 @@ async fn handle_socket_inner(
                                 }
                             };
 
+                            if text.len() > 64 * 1024 {
+                                send_socket_message(&mut socket, ServerResponse::Error("Request exceeds 64 KiB limit".into())).await;
+                                continue;
+                            }
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                                if value["method"] == "post" {
+                                    match serde_json::from_value::<PostRequest>(value) {
+                                        Ok(post) if info_jobs.len() < MAX_PENDING => {
+                                            let bridge = info_bridge.clone();
+                                            let book_listener = listener.clone();
+                                            info_jobs.push(async move {
+                                                let id = post.id;
+                                                tokio::time::timeout(std::time::Duration::from_secs(2), execute_info_post(post, bridge, book_listener))
+                                                    .await.unwrap_or_else(|_| PostResponse::error(id, "504: Info request timed out"))
+                                            }.boxed());
+                                        }
+                                        Ok(post) => send_socket_message(&mut socket, ServerResponse::Post(PostResponse::error(post.id, "429: maximum four pending Info requests per connection"))).await,
+                                        Err(_) => send_socket_message(&mut socket, ServerResponse::Error("Invalid post request: id must be an unsigned integer and request is required".into())).await,
+                                    }
+                                    continue;
+                                }
+                            }
                             info!("Client message: {text}");
 
                             if let Ok(value) = serde_json::from_str::<ClientMessage>(text) {
@@ -328,10 +367,46 @@ async fn receive_client_message(
     }
 }
 
+async fn execute_info_post(
+    post: PostRequest,
+    bridge: InfoBridge,
+    listener: Arc<Mutex<OrderBookListener>>,
+) -> PostResponse {
+    if post.request["type"] != "info" || post.request["payload"]["type"] != "l2Book" {
+        return bridge.execute(post).await;
+    }
+    let _permit = match bridge.acquire() {
+        Ok(permit) => permit,
+        Err(error) => return PostResponse::error(post.id, error),
+    };
+    let Ok(subscription @ Subscription::L2Book { .. }) =
+        serde_json::from_value::<Subscription>(post.request["payload"].clone())
+    else {
+        return PostResponse::error(post.id, "400: invalid l2Book Info payload");
+    };
+    {
+        let book = listener.lock().await;
+        if !book.is_ready() {
+            return PostResponse::error(post.id, "503: local book is not ready");
+        }
+        let universe = book.universe().into_iter().map(|c| c.value()).collect();
+        if !subscription.validate(&universe) {
+            return PostResponse::error(post.id, "400: unsupported market or L2 parameters");
+        }
+    }
+    match subscription.handle_immediate_snapshot(listener).await {
+        Ok(Some((ServerResponse::L2Book(book), _))) => PostResponse {
+            id: post.id,
+            response: serde_json::json!({"type":"info","payload":{"type":"l2Book","data":book}}),
+        },
+        _ => PostResponse::error(post.id, "503: local book is not ready"),
+    }
+}
+
 fn unsupported_request_message(text: &str) -> String {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
         if value["method"] == "post" {
-            return "WebSocket post is not implemented by this server; use the node HTTP /info endpoint for supported Info queries. See /capabilities.".into();
+            return "Invalid WebSocket post; expected id and request with type info. See /capabilities.".into();
         }
         if let Some(kind) = value["subscription"]["type"].as_str() {
             if ["orderUpdates", "userFills", "openOrders"].contains(&kind) {

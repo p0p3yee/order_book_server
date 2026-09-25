@@ -73,6 +73,7 @@ impl Subscription {
 #[serde(tag = "channel", content = "data")]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ServerResponse {
+    Post(crate::servers::info::PostResponse),
     Status(crate::listeners::order_book::FeedStatus),
     SubscriptionResponse(ClientMessage),
     L2Book(L2Book),

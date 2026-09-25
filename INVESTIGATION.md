@@ -4,6 +4,10 @@ Follow-up: [instrumented five-minute capture analysis](CAPTURE_ANALYSIS_20260925
 contains host evidence, measured stage costs, and a correction to process discovery
 in the host collector. That correction does not require a WS container rebuild.
 
+Protocol follow-up: [WS_INFO.md](WS_INFO.md) describes newly implemented read-only
+WebSocket Info posts. The unsupported-post findings below describe the earlier
+deployed version. Wallet subscriptions remain unsupported.
+
 ## Findings and evidence
 
 The service at `NODE_LAN_IP:8000` has the behavior of this fork's market-data-only
@@ -108,8 +112,8 @@ the filtered L4 book unsuitable as a wallet's complete open-order inventory. His
 fill snapshots and recovery after a gap need an explicit replay/history strategy;
 the observed local Info endpoint cannot supply `userFills`. Never fabricate an empty
 complete history snapshot. Keep wallet continuity independent of book resyncs.
-An Info-only WS post adapter could be added independently, with bounded requests,
-timeouts, and the public response envelope. Neither extension is implemented here.
+The subsequent [Info-only WS post adapter](WS_INFO.md) adds bounded requests,
+timeouts, and the public response envelope. Wallet event streaming remains unimplemented.
 
 ## Changes prepared locally
 

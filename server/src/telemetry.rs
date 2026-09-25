@@ -116,9 +116,11 @@ pub(crate) fn version() -> Value {
 }
 pub(crate) fn capabilities() -> Value {
     json!({"server":version(),"subscriptions":["l2Book","trades","l4Book"],
-        "methods":["subscribe","unsubscribe"],"wallet_subscriptions":false,"websocket_info_post":false,
+        "methods":["subscribe","unsubscribe","post"],"wallet_subscriptions":false,"websocket_info_post":true,
+        "websocket_info_queries":crate::servers::info::QUERIES,"websocket_actions":false,
+        "info_post_limits":{"per_connection":4,"global":16,"timeout_ms":2000,"response_bytes":2097152},
         "l2_default_depth":20,"l2_depth_parameter":"nLevels","l2_max_depth":100,
-        "wallet_info_transport":"HTTP POST to the node Info endpoint; openOrders is supported by hl-node"})
+        "wallet_info_transport":"Node HTTP Info or WebSocket post/info for supported read-only queries; wallet subscriptions are not implemented"})
 }
 
 #[cfg(test)]

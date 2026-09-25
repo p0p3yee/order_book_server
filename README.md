@@ -39,8 +39,8 @@ Streamed mode remains experimental until the node's output continuity is verifie
 See [INVESTIGATION.md](INVESTIGATION.md) for the September 25 LAN measurements,
 wallet API limitations, stage timing instrumentation, and host diagnostics commands.
 `/version`, `/capabilities`, and `/diagnostics` describe the running build and its
-bounded timing samples. Wallet subscriptions and WebSocket Info posts are not
-implemented; use node HTTP Info for supported queries such as `openOrders`.
+bounded timing samples. [WebSocket Info posts](WS_INFO.md) support bounded read-only
+queries such as `openOrders` and local `l2Book`. Wallet subscriptions remain unimplemented.
 
 L2 aggregation follows active market/rounding subscriptions while all configured
 books continue reconstructing and validating. See [PERFORMANCE_FOLLOWUP.md](PERFORMANCE_FOLLOWUP.md)

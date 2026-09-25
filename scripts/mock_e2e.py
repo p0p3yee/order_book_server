@@ -68,6 +68,21 @@ def main():
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                if body.get('type') != 'fileSnapshot':
+                    # Delay one read-only query to verify L2 keeps flowing while HTTP is pending.
+                    if body.get('user') == 'slow': time.sleep(.4)
+                    if body.get('user') == 'timeout': time.sleep(2.5)
+                    if body.get('user') == 'fail':
+                        self.send_response(503); self.end_headers(); self.wfile.write(b'temporary failure'); return
+                    if body.get('user') == 'oversized':
+                        self.send_response(200); self.send_header('Content-Length',str(2097153)); self.end_headers(); return
+                    if body.get('user') == 'badjson':
+                        self.send_response(200); self.end_headers(); self.wfile.write(b'{'); return
+                    self.send_response(200); self.end_headers()
+                    data = [] if body.get('type') == 'openOrders' else {'time':123}
+                    try: self.wfile.write(json.dumps(data).encode())
+                    except BrokenPipeError: pass
+                    return
                 with lock:
                     state['snapshots'] += 1
                     height = state['height']
@@ -149,6 +164,10 @@ def main():
                 with lock: state['pause'] = True; state['fail_snapshot'] = True
                 ws.until('status', predicate=lambda m: m['data']['state'] == 'Stale')
                 assert health()['state'] != 'Ready'
+                ws.send({'method':'post','id':99,'request':{'type':'info','payload':{'type':'l2Book','coin':'BTC'}}})
+                stale_reply=ws.until('post')['data']
+                assert stale_reply['id']==99 and stale_reply['response']['type']=='error'
+                assert '503' in stale_reply['response']['payload']
                 # Allow a failed snapshot request, then restore the same mock upstream.
                 time.sleep(1.2)
                 with lock: state['pause'] = False; state['fail_snapshot'] = False
@@ -169,8 +188,42 @@ def main():
                     ws.send({'method':'subscribe','subscription':{'type':kind,'user':'0x'+'0'*40}})
                     assert 'not implemented' in ws.until('error')['data']
                 ws.send({'method':'post','id':1,'request':{'type':'info','payload':{'type':'exchangeStatus'}}})
-                assert 'not implemented' in ws.until('error')['data']
-                ws.until('l2Book')  # unsupported methods must not disconnect the market-data client
+                post = ws.until('post')['data']
+                assert post == {'id':1,'response':{'type':'info','payload':{'type':'exchangeStatus','data':{'time':123}}}}
+                assert capabilities['websocket_info_post'] is True
+                ws.send({'method':'post','id':2,'request':{'type':'info','payload':{'type':'openOrders','user':'slow'}}})
+                books_while_waiting = 0
+                while True:
+                    msg=ws.recv()
+                    if msg['channel']=='l2Book': books_while_waiting+=1
+                    if msg['channel']=='post':
+                        assert msg['data']['id']==2 and msg['data']['response']['payload']['data']==[]
+                        break
+                assert books_while_waiting >= 2, 'HTTP Info blocked book delivery'
+                for request_id,user in [(3,'fail'),(4,'timeout')]:
+                    ws.send({'method':'post','id':request_id,'request':{'type':'info','payload':{'type':'openOrders','user':user}}})
+                    reply=ws.until('post')['data']
+                    assert reply['id']==request_id and reply['response']['type']=='error'
+                    assert ('503' if user=='fail' else '504') in reply['response']['payload']
+                    ws.until('l2Book')
+                with lock: snapshots_before_post = state['snapshots']
+                ws.send({'method':'post','id':5,'request':{'type':'info','payload':{'type':'fileSnapshot','outPath':'unused'}}})
+                assert ws.until('post')['data']['response']['type']=='error'
+                with lock: assert state['snapshots']==snapshots_before_post, 'Info post allowed full snapshot request'
+                ws.until('l2Book')
+                ws.send({'method':'post','id':6,'request':{'type':'info','payload':{'type':'l2Book','coin':'BTC','nLevels':5}}})
+                reply=ws.until('post')['data']
+                assert reply['id']==6 and reply['response']['payload']['data']['coin']=='BTC'
+                for request_id,user in [(7,'oversized'),(8,'badjson')]:
+                    ws.send({'method':'post','id':request_id,'request':{'type':'info','payload':{'type':'openOrders','user':user}}})
+                    reply=ws.until('post')['data']
+                    assert reply['id']==request_id and reply['response']['type']=='error'
+                    ws.until('l2Book')
+                for request_id in range(10,15):
+                    ws.send({'method':'post','id':request_id,'request':{'type':'info','payload':{'type':'openOrders','user':'slow'}}})
+                replies=[ws.until('post')['data'] for _ in range(5)]
+                assert {r['id'] for r in replies}==set(range(10,15))
+                assert any(r['response']['type']=='error' and '429' in r['response']['payload'] for r in replies)
                 assert endpoint('diagnostics')['l2_demand'] == {'markets':1,'variants':1}
                 second = WS(port)
                 try:

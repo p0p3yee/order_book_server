@@ -81,3 +81,15 @@ these do not retroactively change the original local-only test scope above.
 * Four collector tests pass, including mocked opt-in profiling selecting the actual
   hl-node child PID. Actual Linux perf execution and production L2 speedup are unverified.
 * No running node/WS configuration changed; no upstream issue submitted.
+
+## WebSocket Info follow-up
+
+* `cargo test --locked`: 45 passed, 1 ignored manual aggregation benchmark.
+* Formatting, native release build, Python syntax and diff checks passed.
+* Both batch/stream process tests passed Info success, slow HTTP with continued L2,
+  timeout, HTTP 503, invalid JSON, response-size limits, per-client overload,
+  rejection of fileSnapshot, local L2 Info, and refusal to answer L2 Info while Stale.
+* Unit tests cover global concurrency rejection and permit release without contacting
+  a node, payload preservation and rejection, and correlated error envelopes.
+* The production container was not changed. Wallet subscriptions are not implemented
+  by this increment; no public wallet feed is contacted or relayed.
