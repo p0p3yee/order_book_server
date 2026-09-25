@@ -4,3 +4,7 @@ server/tmp/
 __pycache__/
 
 .env
+
+.env.*
+!.env.example
+*.private.json

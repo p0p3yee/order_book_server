@@ -22,7 +22,7 @@ services:
       RAYON_NUM_THREADS: "${RAYON_NUM_THREADS:-2}"
       TOKIO_WORKER_THREADS: "${TOKIO_WORKER_THREADS:-2}"
     volumes:
-      - "${HL_DATA_DIR:-/path/to/node-data}:/node-data"
+      - "${HL_DATA_DIR:?Set HL_DATA_DIR in your private environment}:/node-data"
     command:
       - --address
       - 0.0.0.0
@@ -33,7 +33,7 @@ services:
       - --snapshot-path
       - /node-data/ws-snapshot.json
       - --snapshot-node-path
-      - "${HL_NODE_SNAPSHOT_PATH:-/path/in/node/data/ws-snapshot.json}"
+      - "${HL_NODE_SNAPSHOT_PATH:?Set HL_NODE_SNAPSHOT_PATH in your private environment}"
       - --info-url
       - http://127.0.0.1:3001/info
       - --markets

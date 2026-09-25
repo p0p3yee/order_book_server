@@ -92,8 +92,8 @@ def http_json(url, payload=None):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--local-ws',default='ws://NODE_LAN_IP:8000/ws')
-    p.add_argument('--local-info',default='http://NODE_LAN_IP:3001/info')
+    p.add_argument('--local-ws',default='ws://127.0.0.1:8000/ws')
+    p.add_argument('--local-info',default='http://127.0.0.1:3001/info')
     p.add_argument('--public-ws',default='wss://api.hyperliquid.xyz/ws')
     p.add_argument('--public-info',default='https://api.hyperliquid.xyz/info')
     p.add_argument('--coin',default='BTC'); p.add_argument('--seconds',type=int,default=60)

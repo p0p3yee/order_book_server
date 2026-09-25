@@ -4,6 +4,10 @@ set -euo pipefail
 revision=${1:?Usage: WS_WALLETS=0xADDRESS[,0xADDRESS] bash deploy_local_wallets.sh FULL_COMMIT_SHA}
 [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { echo 'Expected full lowercase commit SHA' >&2; exit 1; }
 : "${WS_WALLETS:?Set WS_WALLETS to the comma-separated trading wallet addresses}"
+: "${HL_DATA_DIR:?Set HL_DATA_DIR to the host node output directory}"
+: "${HL_NODE_SNAPSHOT_PATH:?Set HL_NODE_SNAPSHOT_PATH to the snapshot file path inside hl-node}"
+[[ "$HL_DATA_DIR" = /* && -d "$HL_DATA_DIR" ]] || { echo 'HL_DATA_DIR must be an existing absolute directory' >&2; exit 1; }
+[[ "$HL_NODE_SNAPSHOT_PATH" = /* ]] || { echo 'HL_NODE_SNAPSHOT_PATH must be absolute' >&2; exit 1; }
 IFS=',' read -r -a selected_wallets <<< "$WS_WALLETS"
 (( ${#selected_wallets[@]} <= 16 )) || { echo 'At most 16 wallets' >&2; exit 1; }
 for wallet in "${selected_wallets[@]}"; do
@@ -31,12 +35,12 @@ docker run -d \
   -e "WS_WALLET_EVENT_INTERVAL_MS=${WS_WALLET_EVENT_INTERVAL_MS:-100}" \
   -e "WS_WALLET_HISTORY_EVENTS=${WS_WALLET_HISTORY_EVENTS:-100000}" \
   -e "WS_WALLET_HISTORY_DAYS=${WS_WALLET_HISTORY_DAYS:-7}" \
-  -v /path/to/node-data:/node-data \
+  -v "$HL_DATA_DIR:/node-data" \
   "$image" \
   --address 0.0.0.0 --port 8000 \
   --node-data-dir /node-data \
   --snapshot-path /node-data/ws-snapshot.json \
-  --snapshot-node-path /path/in/node/data/ws-snapshot.json \
+  --snapshot-node-path "$HL_NODE_SNAPSHOT_PATH" \
   --info-url http://127.0.0.1:3001/info \
   --markets BTC,HYPE,AERO,xyz:NVDA,xyz:DRAM \
   --websocket-compression-level 0 --integrity-interval-secs 0 --poll-interval-ms 5
