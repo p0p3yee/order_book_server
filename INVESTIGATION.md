@@ -1,5 +1,9 @@
 # LAN feed investigation — September 25, 2026 UTC
 
+Follow-up: [instrumented five-minute capture analysis](CAPTURE_ANALYSIS_20260925.md)
+contains host evidence, measured stage costs, and a correction to process discovery
+in the host collector. That correction does not require a WS container rebuild.
+
 ## Findings and evidence
 
 The service at `NODE_LAN_IP:8000` has the behavior of this fork's market-data-only

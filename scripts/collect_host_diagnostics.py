@@ -3,6 +3,7 @@
 import argparse
 import datetime
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -16,6 +17,24 @@ def run(args):
         p = subprocess.run(args, capture_output=True, text=True, timeout=10)
         return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
     except Exception as err: return {'error':str(err)}
+
+
+def container_processes(name, init_pid):
+    # Docker inspect's PID can be docker-init when --init is enabled. Include
+    # actual container processes, using comm rather than potentially secret args.
+    result = run(['docker', 'top', name, '-eo', 'pid,comm'])
+    processes = {}
+    if init_pid:
+        processes[init_pid] = 'container-init'
+    if result.get('returncode') == 0:
+        for line in result.get('stdout', '').splitlines():
+            fields = line.split(None, 1)
+            if len(fields) == 2 and fields[0].isdigit():
+                processes[int(fields[0])] = fields[1]
+    else:
+        result = {'error': result.get('stderr') or result.get('error') or 'docker top failed'}
+        return processes, result
+    return processes, None
 
 
 def main():
@@ -41,21 +60,28 @@ def main():
                 'restart_count':c['RestartCount'],'network_mode':host.get('NetworkMode'), 'nano_cpus':host.get('NanoCpus'),
                 'cpu_quota':host.get('CpuQuota'),'cpu_period':host.get('CpuPeriod'),'memory_limit':host.get('Memory'),
                 'image_labels':{k:v for k,v in (c.get('Config',{}).get('Labels') or {}).items() if k.startswith('org.opencontainers.image.')}}
-            if state['Pid']:pids.append(state['Pid'])
+            processes, error = container_processes(name, state['Pid'])
+            metadata['containers'][name]['processes_at_start'] = processes
+            if error: metadata['containers'][name]['process_discovery_error'] = error
+            pids.extend(processes)
         except Exception:
             metadata['containers'][name]={'error':'docker inspect unavailable', 'stderr':result.get('stderr',result.get('error'))}
     metadata['clock']=run(['timedatectl','show','-p','NTPSynchronized','-p','TimeUSec'])
     metadata['chrony']=run(['chronyc','tracking'])
     metadata['tcp_listeners']=run(['ss','-ltnp','sport = :8000'])
+    metadata['process_sampling_note']='PIDs discovered at collection start; rerun after a container restart. Shared cgroup counters must not be summed across processes.'
+    pids = sorted(set(pids))
     (out/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n')
     jobs=[]; files=[]
     commands=[('vmstat.txt',['vmstat','1',str(a.seconds+1)]),
-              ('iostat.txt',['iostat','-x','1',str(a.seconds+1)])]
+              ('iostat.txt',['iostat','-x','1',str(a.seconds+1)]),
+              ('mpstat.txt',['mpstat','-P','ALL','1',str(a.seconds)])]
     if pids:commands.append(('pidstat.txt',['pidstat','-dru','-p',','.join(map(str,pids)),'1',str(a.seconds)]))
     for filename,command in commands:
         if shutil.which(command[0]):
             f=(out/filename).open('w');files.append(f)
-            jobs.append(subprocess.Popen(command,stdout=f,stderr=subprocess.STDOUT))
+            jobs.append(subprocess.Popen(command,stdout=f,stderr=subprocess.STDOUT,
+                                         env={**os.environ, 'LC_ALL':'C', 'TZ':'UTC'}))
         else:(out/filename).write_text(f'{command[0]} unavailable; no package installation attempted\n')
     def read(path):
         try:return Path(path).read_text()
