@@ -142,7 +142,9 @@ def main():
             until(ws,'walletStatus',lambda m:m['data'].get('scope')=='allDexsClearinghouseState' and m['data']['state']=='Stale')
             # After declared failure no partial perp sample may leak; independent spot keeps working.
             spot_seen=False
-            deadline=time.monotonic()+1.2
+            # Allow the 1s sampling period plus the 2s bounded HTTP work window;
+            # 1.2s was a flaky scheduling assertion under three-wallet fanout.
+            deadline=time.monotonic()+3.0
             while time.monotonic()<deadline:
                 m=receive(ws);assert m['channel']!='allDexsClearinghouseState'
                 spot_seen |= m['channel']=='spotState'

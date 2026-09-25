@@ -108,3 +108,13 @@ complete allowlist, inspect version/capabilities/diagnostics, run a paired passi
 public/local observation containing actual naturally occurring fills, compare
 missing/conflicting/duplicate/reordered events and latency tails, and measure host
 CPU/disk/HTTP load. No production latency gain or full public API parity is claimed.
+
+## Brief backlog grace
+
+An already-ready wallet can continue delivering validated records during less than
+100 ms of read backlog, provided both source timestamps remain fresh and the
+journal is healthy. This does not renew event timestamps. Sustained backlog,
+stale input, startup replay and actual gaps remain gated. Consumers must still
+apply their own event-age limits; the service's default stale threshold is five
+seconds. Stale contiguous book replay is similarly applied while book delivery is
+gated, avoiding repeated snapshots solely because intermediate records are old.

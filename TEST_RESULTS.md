@@ -217,3 +217,27 @@ wallet process modes exercise stale upstream recovery on the same connection
 without an invented generation/gap. The large-record test now waits for independent
 wallet startup rather than incorrectly equating book health with wallet readiness.
 Production pause frequency and event delivery still require a post-deploy capture.
+
+## Bounded wallet catch-up and stale book replay
+
+* Old but contiguous book updates are validated and applied while publication is
+  gated. They no longer discard an authoritative snapshot solely for timestamp
+  age. A Ready-to-Stale transition invalidates queued book frames; a fresh block
+  resumes with a reset/snapshot. Actual block gaps and validation errors still
+  recover. Batch and streamed process tests assert no L2/L4 frames during stale
+  replay and no additional snapshot while it catches up.
+* An already-ready wallet tolerates less than 100 ms of read backlog only while
+  both sources remain fresh and persistence is healthy. Startup, gaps, persistence
+  failure and stale timestamps bypass this grace. Backlog polls sleep at most 1 ms;
+  byte/record budgets remain bounded. `wallet.metrics.backlog_age_us` measures it.
+* Source age is checked before each batch notification. Unit tests cover the
+  99/100 ms boundary and each fail-closed condition; existing process tests cover
+  same-connection stale recovery, gaps, persistence failure and incremental replay.
+
+Validation: 69 Rust tests passed, two ignored; release build and formatting passed.
+All six process scenarios passed: book batch/stream, wallet large-record/batch/stream,
+and bot compatibility. The account-isolation test's 1.2-second spot-refresh window
+failed once and passed on unchanged retry; it now allows the one-second sampling
+period plus the two-second HTTP work window, retaining strict partial-perp rejection.
+These synthetic tests do not establish production latency gains or remove node
+output delays. Passive deployment verification remains required.

@@ -342,9 +342,19 @@ impl OrderBookListener {
             self.last_progress = Instant::now();
             let age = chrono::Utc::now().timestamp_millis().max(0) as u64;
             if age.saturating_sub(time) > self.config.stale_after.as_millis() as u64 {
-                return Err(
-                    format!("upstream event time stale: block={next} age_ms={}", age.saturating_sub(time)).into()
-                );
+                // Age is not a reconstruction mismatch. Preserve validated contiguous
+                // replay while gating all book delivery until a fresh block is applied.
+                // Invalidate queued publications from the previous Ready period.
+                if self.status.state == Health::Ready {
+                    self.status.generation += 1;
+                }
+                if self.status.state != Health::Stale {
+                    self.status.state = Health::Stale;
+                    self.status.reason =
+                        format!("contiguous replay catching up: block={next} age_ms={}", age.saturating_sub(time));
+                    self.status_message();
+                }
+                continue;
             }
             if self.status.state != Health::Ready {
                 self.status.state = Health::Ready;
@@ -798,9 +808,11 @@ mod tests {
         let mut line: Value = serde_json::from_str(&batch(101, vec![])).unwrap();
         line["block_time"] = json!("2020-01-01T00:00:00");
         book.ingest(0, &line.to_string()).unwrap();
-        let err = book.ingest(1, &line.to_string()).unwrap_err();
-        book.recover(err, true);
+        book.ingest(1, &line.to_string()).unwrap();
         assert_eq!(book.status.state, Health::Stale);
+        assert!(book.state.is_some());
+        assert_eq!(book.status.validation_failures, 0);
+        assert_eq!(book.status.resyncs, 0);
         assert!(
             book.current_l2(&Subscription::L2Book {
                 coin: "BTC".into(),
@@ -810,6 +822,32 @@ mod tests {
             })
             .is_none()
         );
+    }
+    #[test]
+    fn old_contiguous_replay_catches_up_without_discarding_book() {
+        let mut book = listener(false);
+        let mut rx = book.internal_message_tx.subscribe();
+        book.install(snapshot(), 100).unwrap();
+        empty_block(&mut book, 101).unwrap();
+        let generation = book.status.generation;
+        while rx.try_recv().is_ok() {}
+        for height in 102..110 {
+            let mut line: Value = serde_json::from_str(&batch(height, vec![])).unwrap();
+            line["block_time"] = json!("2020-01-01T00:00:00");
+            book.ingest(0, &line.to_string()).unwrap();
+            book.ingest(1, &line.to_string()).unwrap();
+            assert!(!book.is_ready());
+            assert!(book.compute_snapshot().is_none());
+        }
+        assert_eq!(book.status.generation, generation + 1);
+        while let Ok(message) = rx.try_recv() {
+            assert!(matches!(*message, InternalMessage::Status(_)));
+        }
+        empty_block(&mut book, 110).unwrap();
+        assert!(book.is_ready());
+        assert_eq!(book.status.height, Some(110));
+        assert_eq!(book.status.resyncs, 0);
+        assert!(empty_block(&mut book, 112).is_err()); // Real gaps still require recovery.
     }
     #[test]
     fn replay_ignores_blocks_at_or_before_snapshot() {

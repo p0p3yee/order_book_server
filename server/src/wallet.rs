@@ -152,6 +152,15 @@ impl State {
     // Readiness gates publication; epoch identifies continuity, not scheduling.
     // Catching up retained input or waiting for fresh upstream data preserves
     // cursors. Actual gaps and persistence failures invalidate continuity below.
+    fn sources_fresh(&self, stale_after: Duration) -> bool {
+        let now = chrono::Utc::now().timestamp_millis();
+        self.sources
+            .iter()
+            .all(|source| source.block_time.is_some_and(|t| now.saturating_sub(t) <= stale_after.as_millis() as i64))
+    }
+    fn can_publish(&self, at_tip: bool, backlog_age: Duration, fresh: bool, persistence_failed: bool) -> bool {
+        !persistence_failed && fresh && (at_tip || (self.ready && backlog_age < Duration::from_millis(100)))
+    }
     fn set_ready(&mut self, ready: bool) -> bool {
         if ready == self.ready && !(ready && self.replaying) {
             return false;
@@ -587,6 +596,7 @@ fn run_worker(
     let mut last_commit = Instant::now();
     let mut last_discovery = Instant::now();
     let mut at_tip = [false; 2];
+    let mut backlog_since: Option<Instant> = None;
     loop {
         if running.upgrade().is_none() {
             break;
@@ -607,7 +617,7 @@ fn run_worker(
                         Ok(Some(line)) => line,
                         Ok(None) => {
                             checkpoints[i].cursor = reader.cursor.clone();
-                            at_tip[i] = true;
+                            at_tip[i] = reader.at_tip().unwrap_or(false);
                             break;
                         }
                         Err(error) => {
@@ -643,6 +653,11 @@ fn run_worker(
                         Ok(changed) => {
                             s.ready = was_ready;
                             s.replaying = was_replaying;
+                            // Enforce age before notifying subscribers about each batch,
+                            // not only after the whole bounded read pass completes.
+                            if !s.sources_fresh(config.stale_after) && s.set_ready(false) {
+                                signal.send_modify(|n| *n += 1);
+                            }
                             checkpoints[i].height = s.sources[i].height;
                             checkpoints[i].time = s.sources[i].block_time;
                             if changed || (i == 1 && previous_height != s.sources[i].height) {
@@ -680,13 +695,16 @@ fn run_worker(
             last_discovery = Instant::now();
         }
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-        let ready = !persistence_failed
-            && at_tip.iter().all(|v| *v)
-            && s.sources.iter().all(|source| {
-                source.block_time.is_some_and(|t| {
-                    chrono::Utc::now().timestamp_millis().saturating_sub(t) <= config.stale_after.as_millis() as i64
-                })
-            });
+        let caught_up = at_tip.iter().all(|v| *v);
+        let backlog_age = if caught_up {
+            backlog_since = None;
+            Duration::ZERO
+        } else {
+            backlog_since.get_or_insert_with(Instant::now).elapsed()
+        };
+        metrics.observe("backlog_age_us", backlog_age.as_secs_f64() * 1e6);
+        let fresh = s.sources_fresh(config.stale_after);
+        let ready = s.can_publish(caught_up, backlog_age, fresh, persistence_failed);
         if s.set_ready(ready) {
             signal.send_modify(|n| *n += 1);
         }
@@ -727,7 +745,14 @@ fn run_worker(
         } else {
             drop(s);
         }
-        std::thread::sleep(config.poll_interval);
+        // Catch-up remains byte/record bounded, but avoid adding the idle polling
+        // delay on every backlog chunk. This worker is independent of the book loop.
+        let delay = if !persistence_failed && !caught_up {
+            config.poll_interval.min(Duration::from_millis(1))
+        } else {
+            config.poll_interval
+        };
+        std::thread::sleep(delay);
     }
     // Graceful worker teardown when used by tests/embedders. Abrupt process exits
     // recover uncommitted records from the last transactional cursor instead.
@@ -1005,6 +1030,21 @@ mod tests {
         let mut bad = event;
         bad["order"].as_object_mut().unwrap().remove("origSz");
         assert!(decode(0, &batch(1, json!([bad])), &allowed).is_err());
+    }
+    #[test]
+    fn backlog_grace_never_masks_stale_input_startup_or_journal_failure() {
+        let mut s = State::new();
+        let brief = Duration::from_millis(99);
+        assert!(!s.can_publish(false, brief, true, false)); // startup must catch up
+        s.set_ready(true);
+        assert!(s.can_publish(false, brief, true, false));
+        assert!(!s.can_publish(false, Duration::from_millis(100), true, false));
+        assert!(!s.can_publish(false, brief, false, false)); // age > stale threshold
+        assert!(!s.can_publish(true, Duration::ZERO, false, false));
+        assert!(!s.can_publish(true, Duration::ZERO, true, true));
+        s.gap("missing block".into());
+        assert!(!s.can_publish(false, brief, true, false));
+        assert!(s.can_publish(true, Duration::ZERO, true, false));
     }
     #[test]
     fn temporary_pause_preserves_continuity_and_replays_undelivered_events() {

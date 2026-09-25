@@ -56,7 +56,7 @@ def main():
     binary = Path(sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith('--') else 'target/release/websocket_server').resolve()
     streamed = '--stream' in sys.argv
     lock = threading.Lock()
-    state = dict(height=100, snapshots=0, pause=False, skip=False, stop=False, malformed=False, rotate=False, fail_snapshot=False)
+    state = dict(height=100, snapshots=0, pause=False, skip=False, stop=False, malformed=False, rotate=False, fail_snapshot=False, old=False)
     with tempfile.TemporaryDirectory(prefix='ws-e2e-') as temp:
         root = Path(temp)
         paths = []
@@ -107,7 +107,8 @@ def main():
                     state['height'] += 2 if state['skip'] else 1
                     state['skip'] = False
                     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
-                    batch = dict(local_time=now, block_time=now, block_number=state['height'], events=[])
+                    block_time = ((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=10)).replace(tzinfo=None).isoformat() if state['old'] else now)
+                    batch = dict(local_time=now, block_time=block_time, block_number=state['height'], events=[])
                     for i, path in enumerate(paths):
                         with path.open('a') as f:
                             if state['malformed'] and i == 2:
@@ -151,9 +152,25 @@ def main():
                 end = time.monotonic() + 11
                 while time.monotonic() < end: ws.until('l2Book')
                 with lock: assert state['snapshots'] == first_count, 'healthy periodic snapshot regression'
-                with lock: state['skip'] = True
+                # Real gap forces one snapshot. Its old but contiguous replay must
+                # remain gated and catch up without discarding/re-requesting it.
+                with lock: state['skip'] = True; state['old'] = True
                 ws.until('status', predicate=lambda m: m['data']['state'] != 'Ready')
+                ws.until('status', predicate=lambda m: m['data']['state'] == 'Stale' and 'catching up' in m['data']['reason'])
+                assert health()['state'] != 'Ready'
+                with lock: recovery_snapshots = state['snapshots']
+                time.sleep(.3)
+                assert health()['state'] != 'Ready'
+                ws.send({'method':'post','id':98,'request':{'type':'info','payload':{'type':'exchangeStatus'}}})
+                while True:
+                    message = ws.recv()
+                    assert message['channel'] not in ('l2Book', 'l4Book'), 'stale replay published a book'
+                    if message['channel'] == 'post' and message['data']['id'] == 98: break
+                with lock:
+                    assert state['snapshots'] == recovery_snapshots
+                    state['old'] = False
                 ws.until('status', predicate=lambda m: m['data']['state'] == 'Ready')
+                with lock: assert state['snapshots'] == recovery_snapshots
                 ws.until('l4Book', predicate=lambda m: 'Snapshot' in m['data'])
                 ws.until('l2Book')
                 # Hour rotation must read the new file's initial data without resnapshotting.
