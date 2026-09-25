@@ -174,7 +174,7 @@ async fn handle_socket_inner(
     let mut demand =
         L2Demand { subscriptions: HashSet::new(), registry: listener.lock().await.l2_subscriptions.clone() };
     let mut book_heights = HashMap::<Subscription, u64>::new();
-    send_socket_message(&mut socket, ServerResponse::Status(listener.lock().await.status.clone())).await;
+    send_current_status(&mut socket, &listener).await;
     loop {
         select! {
             _ = wallet_tick.tick(), if wallets.polls() => { wallets.schedule(info_bridge.clone()); }
@@ -245,7 +245,7 @@ async fn handle_socket_inner(
                         if let Some(metrics) = telemetry::socket_metrics() { metrics.observe("client_lagged_messages", n as f64); }
                         internal_message_rx = internal_message_tx.subscribe();
                         send_socket_message(&mut socket, ServerResponse::Error(format!("Client fell behind by {n} messages; book snapshots reset; trades may have gaps"))).await;
-                        send_socket_message(&mut socket, ServerResponse::Status(listener.lock().await.status.clone())).await;
+                        send_current_status(&mut socket, &listener).await;
                         refresh_books(&mut socket, &manager, &listener, &mut book_heights).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -479,11 +479,30 @@ fn unsupported_request_message(text: &str) -> String {
         .into()
 }
 
-async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
+// Clone under a separate statement: a temporary guard in an awaited send's
+// arguments otherwise stays alive until the peer accepts the write.
+async fn send_current_status<S>(socket: &mut S, listener: &Arc<Mutex<OrderBookListener>>)
+where
+    S: futures_util::Sink<FrameView> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let status = listener.lock().await.status.clone();
+    send_socket_message(socket, ServerResponse::Status(status)).await;
+}
+
+async fn send_socket_message<S>(socket: &mut S, msg: ServerResponse)
+where
+    S: futures_util::Sink<FrameView> + Unpin,
+    S::Error: std::fmt::Display,
+{
     send_socket_value(socket, msg).await;
 }
 
-async fn send_socket_value(socket: &mut WebSocket, msg: impl serde::Serialize) {
+async fn send_socket_value<S>(socket: &mut S, msg: impl serde::Serialize)
+where
+    S: futures_util::Sink<FrameView> + Unpin,
+    S::Error: std::fmt::Display,
+{
     let metrics = telemetry::socket_metrics();
     let trace = telemetry::socket_trace();
     let serialize_start = std::time::Instant::now();
@@ -793,5 +812,44 @@ mod demand_tests {
         assert_eq!(registry.lock().unwrap()[&sub], 1);
         drop(second);
         assert!(registry.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod backpressure_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blocked_status_writer_does_not_hold_book_lock() {
+        let (tx, _) = channel(100);
+        let listener = Arc::new(Mutex::new(OrderBookListener::new(tx, crate::ServerConfig::default())));
+        // This sink accepts a frame but never completes its write. Polling once
+        // deterministically reaches backpressure, without filling OS buffers.
+        let mut sink = Box::pin(futures_util::sink::unfold((), |(), _: FrameView| async {
+            futures_util::future::pending::<std::result::Result<(), io::Error>>().await
+        }));
+        let mut send = Box::pin(send_current_status(&mut sink, &listener));
+        assert!(send.as_mut().now_or_never().is_none());
+        let book = listener.try_lock().expect("slow client must not block health, diagnostics or reconstruction");
+        drop(book.diagnostics());
+        drop(book);
+        drop(send);
+        assert!(listener.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn inline_guard_reproduces_previous_global_stall() {
+        let (tx, _) = channel(100);
+        let listener = Arc::new(Mutex::new(OrderBookListener::new(tx, crate::ServerConfig::default())));
+        let mut sink = Box::pin(futures_util::sink::unfold((), |(), _: FrameView| async {
+            futures_util::future::pending::<std::result::Result<(), io::Error>>().await
+        }));
+        let mut old_send = Box::pin(async {
+            send_socket_message(&mut sink, ServerResponse::Status(listener.lock().await.status.clone())).await;
+        });
+        assert!(old_send.as_mut().now_or_never().is_none());
+        assert!(listener.try_lock().is_err(), "control must reproduce old lock lifetime");
+        drop(old_send);
+        assert!(listener.try_lock().is_ok());
     }
 }

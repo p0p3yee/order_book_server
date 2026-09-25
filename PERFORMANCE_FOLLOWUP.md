@@ -84,3 +84,16 @@ tests cover shared demand, duplicate updates, unsubscribe and drop. Process test
 cover live subscription replacement in addition to the existing recovery cases.
 Deploy only after the normal build process; these commits do not update a running
 container. Keep the current node flags and one-second bot age gate.
+
+## Status-send backpressure isolation
+
+Initial and lag-recovery WebSocket status messages clone the book status before
+awaiting socket output. Previously, a temporary mutex guard in the send arguments
+remained alive throughout the write: a blocked client could block reconstruction,
+`/health`, and `/diagnostics`, while lock-independent `/version` still responded.
+The deterministic `backpressure_tests` reproduce the old lock lifetime and verify
+that the actual replacement status-send helper leaves the lock available with a
+writer that never completes. This establishes a code defect, not a confirmed
+attribution for a particular production timeout. A blocked writer can still stall
+its own client task; this patch isolates shared book progress without adding new
+client timeout/disconnection policy.
