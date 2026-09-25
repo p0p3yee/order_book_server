@@ -109,13 +109,13 @@ impl Px {
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::cast_sign_loss)]
     pub(crate) fn parse_from_str(value: &str) -> Result<Self> {
-        let value = (value.parse::<f64>()? * MULTIPLIER).round() as u64;
+        let value = parse_decimal(value)?;
         Ok(Self::new(value))
     }
 
     #[must_use]
     pub(crate) fn to_str(self) -> String {
-        let s = format!("{:.8}", (self.value() as f64) / MULTIPLIER);
+        let s = format!("{}.{:08}", self.value() / 100_000_000, self.value() % 100_000_000);
         let s = s.trim_end_matches('0');
         s.trim_end_matches('.').to_string()
     }
@@ -131,14 +131,46 @@ impl Sz {
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::cast_sign_loss)]
     pub(crate) fn parse_from_str(value: &str) -> Result<Self> {
-        let value = (value.parse::<f64>()? * MULTIPLIER).round() as u64;
+        let value = parse_decimal(value)?;
         Ok(Self::new(value))
     }
 
     #[must_use]
     pub(crate) fn to_str(self) -> String {
-        let s = format!("{:.8}", (self.value() as f64) / MULTIPLIER);
+        let s = format!("{}.{:08}", self.value() / 100_000_000, self.value() % 100_000_000);
         let s = s.trim_end_matches('0');
         s.trim_end_matches('.').to_string()
+    }
+}
+
+fn parse_decimal(value: &str) -> Result<u64> {
+    let (whole, frac) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|c| c.is_ascii_digit())
+        || !frac.bytes().all(|c| c.is_ascii_digit())
+        || (frac.len() > 8 && frac[8..].bytes().any(|c| c != b'0'))
+    {
+        return Err("invalid fixed point decimal".into());
+    }
+    let frac = &frac[..frac.len().min(8)];
+    let fraction = if frac.is_empty() { 0 } else { frac.parse::<u64>()? * 10_u64.pow(8 - frac.len() as u32) };
+    whole
+        .parse::<u64>()?
+        .checked_mul(100_000_000)
+        .and_then(|v| v.checked_add(fraction))
+        .ok_or_else(|| "decimal overflow".into())
+}
+
+#[cfg(test)]
+mod decimal_tests {
+    use super::*;
+    #[test]
+    fn exact_prices_and_invalid_numbers() {
+        for v in ["100.00000001", "99999999.99999999", "0.00000001"] {
+            assert_eq!(Px::parse_from_str(v).unwrap().to_str(), v);
+        }
+        for v in ["NaN", "inf", "-1", "1e3", "0.000000001", "99999999999999999999999"] {
+            assert!(Px::parse_from_str(v).is_err());
+        }
     }
 }

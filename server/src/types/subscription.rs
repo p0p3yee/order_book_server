@@ -35,12 +35,8 @@ impl Subscription {
                     info!("Invalid subscription: coin not found");
                     return false;
                 }
-                if *n_levels == Some(DEFAULT_LEVELS) {
-                    info!("Invalid subscription: set n_levels to this by using null");
-                    return false;
-                }
                 let n_levels = n_levels.unwrap_or(DEFAULT_LEVELS);
-                if n_levels > MAX_LEVELS {
+                if n_levels == 0 || n_levels > MAX_LEVELS {
                     info!("Invalid subscription: n_levels too high");
                     return false;
                 }
@@ -77,6 +73,7 @@ impl Subscription {
 #[serde(tag = "channel", content = "data")]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ServerResponse {
+    Status(crate::listeners::order_book::FeedStatus),
     SubscriptionResponse(ClientMessage),
     L2Book(L2Book),
     L4Book(L4Book),

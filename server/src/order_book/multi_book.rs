@@ -1,15 +1,16 @@
 use crate::{
-    order_book::{Coin, InnerOrder, Oid, OrderBook, Snapshot, Sz},
+    order_book::{Coin, InnerOrder, Oid, OrderBook, Px, Snapshot, Sz},
     prelude::*,
 };
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::Path,
-};
+use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+use std::path::Path;
+#[cfg(test)]
 use tokio::fs::read_to_string;
 
+#[derive(Clone)]
 pub(crate) struct Snapshots<O>(HashMap<Coin, Snapshot<O>>);
 
 impl<O> Snapshots<O> {
@@ -49,9 +50,18 @@ impl<O: InnerOrder> OrderBooks<O> {
     // Returns false when `insert_before` cannot be honored; see OrderBook::add_order_before.
     pub(crate) fn add_order_before(&mut self, order: O, insert_before: Option<Oid>) -> bool {
         let coin = &order.coin();
-        self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).add_order_before(order, insert_before)
+        self.order_books.entry(coin.clone()).or_insert_with(OrderBook::new).insert_raw(order, insert_before)
     }
 
+    pub(crate) fn validate_order(&mut self, coin: &Coin, oid: &Oid, px: Px, size: Option<Sz>) -> Result<()> {
+        self.order_books.get_mut(coin).ok_or("missing order book")?.validate_order(oid, px, size)
+    }
+    pub(crate) fn validate_uncrossed(&self) -> Result<()> {
+        for book in self.order_books.values() {
+            book.validate_uncrossed()?;
+        }
+        Ok(())
+    }
     pub(crate) fn cancel_order(&mut self, oid: Oid, coin: Coin) -> bool {
         self.order_books.get_mut(&coin).is_some_and(|book| book.cancel_order(oid))
     }
@@ -92,6 +102,7 @@ where
     ))
 }
 
+#[cfg(test)]
 pub(crate) async fn load_snapshots_from_json<O, R>(path: &Path) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,

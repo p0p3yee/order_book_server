@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-
 use alloy::primitives::Address;
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
@@ -19,6 +17,9 @@ pub(crate) struct NodeDataOrderDiff {
 }
 
 impl NodeDataOrderDiff {
+    pub(crate) fn price(&self) -> crate::Result<crate::order_book::Px> {
+        crate::order_book::Px::parse_from_str(&self.px)
+    }
     pub(crate) fn diff(&self) -> OrderDiff {
         self.raw_book_diff.clone()
     }
@@ -49,36 +50,18 @@ impl NodeDataOrderStatus {
     }
 }
 
-#[derive(Clone, Copy, strum_macros::Display)]
-pub(crate) enum EventSource {
-    Fills,
-    OrderStatuses,
-    OrderDiffs,
-}
-
-impl EventSource {
-    #[must_use]
-    pub(crate) fn event_source_dir(self, dir: &Path) -> PathBuf {
-        match self {
-            Self::Fills => dir.join("hl/data/node_fills_by_block"),
-            Self::OrderStatuses => dir.join("hl/data/node_order_statuses_by_block"),
-            Self::OrderDiffs => dir.join("hl/data/node_raw_book_diffs_by_block"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Batch<E> {
-    local_time: NaiveDateTime,
-    block_time: NaiveDateTime,
-    block_number: u64,
-    events: Vec<E>,
+    pub(crate) local_time: NaiveDateTime,
+    pub(crate) block_time: NaiveDateTime,
+    pub(crate) block_number: u64,
+    pub(crate) events: Vec<E>,
 }
 
 impl<E> Batch<E> {
     #[allow(clippy::unwrap_used)]
     pub(crate) fn block_time(&self) -> u64 {
-        self.block_time.and_utc().timestamp_millis().try_into().unwrap()
+        self.block_time.and_utc().timestamp_millis().try_into().unwrap_or_default()
     }
 
     pub(crate) const fn block_number(&self) -> u64 {

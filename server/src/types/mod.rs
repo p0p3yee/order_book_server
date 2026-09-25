@@ -57,22 +57,29 @@ impl L2Book {
 }
 
 impl Trade {
-    #[allow(clippy::unwrap_used)]
-    pub(crate) fn from_fills(mut fills: HashMap<Side, NodeDataFill>) -> Self {
-        let NodeDataFill(seller, ask_fill) = fills.remove(&Side::Ask).unwrap();
-        let NodeDataFill(buyer, bid_fill) = fills.remove(&Side::Bid).unwrap();
-        let ask_is_taker = ask_fill.crossed;
-        let side = if ask_is_taker { Side::Ask } else { Side::Bid };
-        let coin = ask_fill.coin.clone();
-        assert_eq!(coin, bid_fill.coin);
-        let tid = ask_fill.tid;
-        assert_eq!(tid, bid_fill.tid);
-        let px = ask_fill.px;
-        let sz = ask_fill.sz;
-        let hash = ask_fill.hash;
-        let time = ask_fill.time;
-        let users = [buyer, seller];
-        Self { coin, side, px, sz, hash, time, tid, users }
+    pub(crate) fn from_fills(mut fills: HashMap<Side, NodeDataFill>) -> crate::Result<Self> {
+        let NodeDataFill(seller, ask_fill) = fills.remove(&Side::Ask).ok_or("missing Ask fill")?;
+        let NodeDataFill(buyer, bid_fill) = fills.remove(&Side::Bid).ok_or("missing Bid fill")?;
+        if ask_fill.coin != bid_fill.coin
+            || ask_fill.tid != bid_fill.tid
+            || ask_fill.px != bid_fill.px
+            || ask_fill.sz != bid_fill.sz
+            || ask_fill.time != bid_fill.time
+            || ask_fill.hash != bid_fill.hash
+            || ask_fill.crossed == bid_fill.crossed
+        {
+            return Err("inconsistent trade pair".into());
+        }
+        Ok(Self {
+            coin: ask_fill.coin,
+            side: if ask_fill.crossed { Side::Ask } else { Side::Bid },
+            px: ask_fill.px,
+            sz: ask_fill.sz,
+            hash: ask_fill.hash,
+            time: ask_fill.time,
+            tid: ask_fill.tid,
+            users: [buyer, seller],
+        })
     }
 }
 

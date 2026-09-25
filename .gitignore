@@ -1,1 +1,6 @@
 target/
+
+server/tmp/
+__pycache__/
+
+.env

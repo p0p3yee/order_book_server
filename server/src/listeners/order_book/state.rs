@@ -19,6 +19,7 @@ pub(super) struct OrderBookState {
     time: u64,
     snapped: bool,
     ignore_spot: bool,
+    markets: HashSet<String>,
 }
 
 impl OrderBookState {
@@ -28,9 +29,11 @@ impl OrderBookState {
         time: u64,
         ignore_triggers: bool,
         ignore_spot: bool,
+        markets: HashSet<String>,
     ) -> Self {
         Self {
             ignore_spot,
+            markets,
             time,
             height,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
@@ -49,7 +52,7 @@ impl OrderBookState {
 
     // (time, snapshot)
     pub(super) fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
-        if self.snapped {
+        if self.snapped && prevent_future_snaps {
             None
         } else {
             self.snapped = prevent_future_snaps || self.snapped;
@@ -68,7 +71,11 @@ impl OrderBookState {
     ) -> Result<()> {
         let height = order_statuses.block_number();
         let time = order_statuses.block_time();
-        assert_eq!(order_statuses.block_number(), order_diffs.block_number());
+        if order_statuses.block_number() != order_diffs.block_number()
+            || order_statuses.block_time() != order_diffs.block_time()
+        {
+            return Err("book stream block metadata mismatch".into());
+        }
         if height > self.height + 1 {
             return Err(format!("Expecting block {}, got block {}", self.height + 1, height).into());
         } else if height <= self.height {
@@ -90,7 +97,9 @@ impl OrderBookState {
         while let Some(diff) = diffs.pop_front() {
             let oid = diff.oid();
             let coin = diff.coin();
-            if coin.is_spot() && self.ignore_spot {
+            if (coin.is_spot() && self.ignore_spot)
+                || (!self.markets.is_empty() && !self.markets.contains(&coin.value()))
+            {
                 continue;
             }
             let inner_diff = diff.diff().try_into()?;
@@ -102,7 +111,11 @@ impl OrderBookState {
                         inner_order.modify_sz(sz);
                         // must replace time with time of entering book, which is the timestamp of the order status update
                         #[allow(clippy::unwrap_used)]
-                        inner_order.convert_trigger(time.try_into().unwrap());
+                        inner_order.convert_trigger(time.try_into()?);
+                        // Raw diff price is authoritative; reject disagreement rather than silently drifting.
+                        if inner_order.coin != coin || inner_order.limit_px != diff.price()? {
+                            return Err(format!("new order price/coin mismatch oid={oid:?}").into());
+                        }
                         if !self.order_book.add_order_before(inner_order, insert_before) {
                             return Err(format!("Unable to find insertBefore order on the book {diff:?}").into());
                         }
@@ -110,18 +123,21 @@ impl OrderBookState {
                         return Err(format!("Unable to find order opening status {diff:?}").into());
                     }
                 }
-                InnerOrderDiff::Update { new_sz, .. } => {
+                InnerOrderDiff::Update { orig_sz, new_sz } => {
+                    self.order_book.validate_order(&coin, &oid, diff.price()?, Some(orig_sz))?;
                     if !self.order_book.modify_sz(oid, coin, new_sz) {
                         return Err(format!("Unable to find order on the book {diff:?}").into());
                     }
                 }
                 InnerOrderDiff::Remove => {
+                    self.order_book.validate_order(&coin, &oid, diff.price()?, None)?;
                     if !self.order_book.cancel_order(oid, coin) {
                         return Err(format!("Unable to find order on the book {diff:?}").into());
                     }
                 }
             }
         }
+        self.order_book.validate_uncrossed()?;
         self.height += 1;
         self.time = time;
         self.snapped = false;

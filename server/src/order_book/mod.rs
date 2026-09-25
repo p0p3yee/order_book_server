@@ -21,6 +21,10 @@ pub(crate) struct OrderBook<O> {
 pub(crate) struct Snapshot<O>([Vec<O>; 2]);
 
 impl<O: Clone> Snapshot<O> {
+    #[cfg(test)]
+    pub(crate) fn new(orders: [Vec<O>; 2]) -> Self {
+        Self(orders)
+    }
     pub(crate) const fn as_ref(&self) -> &[Vec<O>; 2] {
         &self.0
     }
@@ -84,6 +88,46 @@ impl<O: InnerOrder> OrderBook<O> {
             self.oid_to_side_px.insert(oid, (side, px));
         }
         true
+    }
+
+    // Applying an authoritative raw diff must never run a matching engine locally.
+    pub(crate) fn insert_raw(&mut self, order: O, insert_before: Option<Oid>) -> bool {
+        let (oid, side, px) = (order.oid(), order.side(), order.limit_px());
+        if self.oid_to_side_px.contains_key(&oid) || !order.sz().is_positive() {
+            return false;
+        }
+        let map = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+        if !add_order_to_book(map, order, insert_before) {
+            return false;
+        }
+        self.oid_to_side_px.insert(oid, (side, px));
+        true
+    }
+    pub(crate) fn validate_order(&mut self, oid: &Oid, px: Px, size: Option<Sz>) -> Result<()> {
+        let (side, stored_px) = self.oid_to_side_px.get(oid).ok_or("diff references missing order")?;
+        if *stored_px != px {
+            return Err("diff price differs from resting order".into());
+        }
+        let levels = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+        let order = levels.get_mut(&px).and_then(|l| l.node_value_mut(oid)).ok_or("missing indexed order")?;
+        if size.is_some_and(|sz| sz != order.sz()) {
+            return Err("diff origSz differs from resting order".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn validate_uncrossed(&self) -> Result<()> {
+        if let (Some((bid, _)), Some((ask, _))) = (self.bids.last_key_value(), self.asks.first_key_value()) {
+            if bid >= ask {
+                return Err("crossed book after complete block".into());
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn cancel_order(&mut self, oid: Oid) -> bool {

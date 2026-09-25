@@ -1,447 +1,287 @@
 use crate::{
-    HL_NODE,
-    listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
+    ServerConfig,
     order_book::{
         Coin, Snapshot,
-        multi_book::{Snapshots, load_snapshots_from_json},
+        multi_book::{Snapshots, load_snapshots_from_str},
     },
     prelude::*,
     types::{
         L4Order,
         inner::{InnerL4Order, InnerLevel},
-        node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
 use alloy::primitives::Address;
-use fs::File;
-use log::{error, info};
-use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
+use log::{info, warn};
+use serde::{Deserialize, Serialize};
+use state::OrderBookState;
 use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Seek, SeekFrom},
-    path::PathBuf,
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::{
-    sync::{
-        Mutex,
-        broadcast::Sender,
-        mpsc::{UnboundedSender, unbounded_channel},
-    },
-    time::{Instant, interval_at, sleep},
-};
-use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
-
+use tail::{Tail, latest_file};
+use tokio::sync::{Mutex, broadcast::Sender};
+use utils::{process_rmp_file, validate_snapshot_consistency};
 mod state;
+mod tail;
 mod utils;
 
-// WARNING - this code assumes no other file system operations are occurring in the watched directories
-// if there are scripts running, this may not work as intended
-pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: PathBuf) -> Result<()> {
-    let order_statuses_dir = EventSource::OrderStatuses.event_source_dir(&dir).canonicalize()?;
-    let fills_dir = EventSource::Fills.event_source_dir(&dir).canonicalize()?;
-    let order_diffs_dir = EventSource::OrderDiffs.event_source_dir(&dir).canonicalize()?;
-    info!("Monitoring order status directory: {}", order_statuses_dir.display());
-    info!("Monitoring order diffs directory: {}", order_diffs_dir.display());
-    info!("Monitoring fills directory: {}", fills_dir.display());
-
-    // monitoring the directory via the notify crate (gives file system events)
-    let (fs_event_tx, mut fs_event_rx) = unbounded_channel();
-    let mut watcher = recommended_watcher(move |res| {
-        let fs_event_tx = fs_event_tx.clone();
-        if let Err(err) = fs_event_tx.send(res) {
-            error!("Error sending fs event to processor via channel: {err}");
-        }
-    })?;
-
-    let ignore_spot = {
-        let listener = listener.lock().await;
-        listener.ignore_spot
-    };
-
-    // every so often, we fetch a new snapshot and the snapshot_fetch_task starts running.
-    // Result is sent back along this channel (if error, we want to return to top level)
-    let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
-
-    watcher.watch(&order_statuses_dir, RecursiveMode::Recursive)?;
-    watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
-    watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
-    let start = Instant::now() + Duration::from_secs(5);
-    let mut ticker = interval_at(start, Duration::from_secs(10));
-    loop {
-        tokio::select! {
-            event = fs_event_rx.recv() =>  match event {
-                Some(Ok(event)) => {
-                    if event.kind.is_create() || event.kind.is_modify() {
-                        let new_path = &event.paths[0];
-                        if new_path.starts_with(&order_statuses_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
-                                .process_update(&event, new_path, EventSource::OrderStatuses)
-                                .map_err(|err| format!("Order status processing error: {err}"))?;
-                        } else if new_path.starts_with(&fills_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
-                                .process_update(&event, new_path, EventSource::Fills)
-                                .map_err(|err| format!("Fill update processing error: {err}"))?;
-                        } else if new_path.starts_with(&order_diffs_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
-                                .process_update(&event, new_path, EventSource::OrderDiffs)
-                                .map_err(|err| format!("Book diff processing error: {err}"))?;
-                        }
-                    }
-                }
-                Some(Err(err)) => {
-                    error!("Watcher error: {err}");
-                    return Err(format!("Watcher error: {err}").into());
-                }
-                None => {
-                    error!("Channel closed. Listener exiting");
-                    return Err("Channel closed.".into());
-                }
-            },
-            snapshot_fetch_res = snapshot_fetch_task_rx.recv() => {
-                match snapshot_fetch_res {
-                    None => {
-                        return Err("Snapshot fetch task sender dropped".into());
-                    }
-                    Some(Err(err)) => {
-                        return Err(format!("Abci state reading error: {err}").into());
-                    }
-                    Some(Ok(())) => {}
-                }
-            }
-            _ = ticker.tick() => {
-                let listener = listener.clone();
-                let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
-            }
-            () = sleep(Duration::from_secs(5)) => {
-                let listener = listener.lock().await;
-                if listener.is_ready() {
-                    return Err(format!("Stream has fallen behind ({HL_NODE} failed?)").into());
-                }
-            }
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Health {
+    Initializing,
+    Ready,
+    Resyncing,
+    Stale,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct FeedStatus {
+    pub state: Health,
+    pub generation: u64,
+    pub height: Option<u64>,
+    pub upstream_time: Option<u64>,
+    pub reason: String,
+    pub resyncs: u64,
+    pub validation_failures: u64,
 }
 
-fn fetch_snapshot(
-    dir: PathBuf,
-    listener: Arc<Mutex<OrderBookListener>>,
-    tx: UnboundedSender<Result<()>>,
-    ignore_spot: bool,
-) {
-    let tx = tx.clone();
-    tokio::spawn(async move {
-        let res = match process_rmp_file(&dir).await {
-            Ok(output_fln) => {
-                let state = {
-                    let mut listener = listener.lock().await;
-                    listener.begin_caching();
-                    listener.clone_state()
-                };
-                let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await;
-                info!("Snapshot fetched");
-                // sleep to let some updates build up.
-                sleep(Duration::from_secs(1)).await;
-                let mut cache = {
-                    let mut listener = listener.lock().await;
-                    listener.take_cache()
-                };
-                info!("Cache has {} elements", cache.len());
-                match snapshot {
-                    Ok((height, expected_snapshot)) => {
-                        if let Some(mut state) = state {
-                            while state.height() < height {
-                                if let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                                    state.apply_updates(order_statuses, order_diffs)?;
-                                } else {
-                                    return Err::<(), Error>("Not enough cached updates".into());
-                                }
-                            }
-                            if state.height() > height {
-                                return Err("Fetched snapshot lagging stored state".into());
-                            }
-                            let stored_snapshot = state.compute_snapshot().snapshot;
-                            info!("Validating snapshot");
-                            validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
-                        } else {
-                            listener.lock().await.init_from_snapshot(expected_snapshot, height);
-                            Ok(())
-                        }
-                    }
-                    Err(err) => Err(err),
-                }
-            }
-            Err(err) => Err(err),
-        };
-        let _unused = tx.send(res);
-        Ok(())
-    });
-}
-
+/// One owner applies book mutations and publishes them synchronously in block order.
 pub(crate) struct OrderBookListener {
-    ignore_spot: bool,
-    fill_status_file: Option<File>,
-    order_status_file: Option<File>,
-    order_diff_file: Option<File>,
-    // None if we haven't seen a valid snapshot yet
-    order_book_state: Option<OrderBookState>,
+    config: ServerConfig,
+    state: Option<OrderBookState>,
+    checkpoint: Option<OrderBookState>,
+    pub(crate) status: FeedStatus,
+    orders: BTreeMap<u64, Batch<NodeDataOrderStatus>>,
+    diffs: BTreeMap<u64, Batch<NodeDataOrderDiff>>,
+    fills: Option<Batch<NodeDataFill>>,
+    order_watermark: Option<u64>,
+    diff_watermark: Option<u64>,
     last_fill: Option<u64>,
-    order_diff_cache: BatchQueue<NodeDataOrderDiff>,
-    order_status_cache: BatchQueue<NodeDataOrderStatus>,
-    // Only Some when we want it to collect updates
-    fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
-    internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+    buffered_bytes: usize,
+    last_progress: Instant,
+    internal_message_tx: Sender<Arc<InternalMessage>>,
+    pub(crate) l2_subscriptions: Arc<std::sync::atomic::AtomicUsize>,
 }
-
 impl OrderBookListener {
-    pub(crate) const fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) fn new(tx: Sender<Arc<InternalMessage>>, config: ServerConfig) -> Self {
         Self {
-            ignore_spot,
-            fill_status_file: None,
-            order_status_file: None,
-            order_diff_file: None,
-            order_book_state: None,
+            config,
+            state: None,
+            checkpoint: None,
+            status: FeedStatus {
+                state: Health::Initializing,
+                generation: 0,
+                height: None,
+                upstream_time: None,
+                reason: "startup".into(),
+                resyncs: 0,
+                validation_failures: 0,
+            },
+            orders: BTreeMap::new(),
+            diffs: BTreeMap::new(),
+            fills: None,
+            order_watermark: None,
+            diff_watermark: None,
             last_fill: None,
-            fetched_snapshot_cache: None,
-            internal_message_tx,
-            order_diff_cache: BatchQueue::new(),
-            order_status_cache: BatchQueue::new(),
+            buffered_bytes: 0,
+            last_progress: Instant::now(),
+            internal_message_tx: tx,
+            l2_subscriptions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
-
-    fn clone_state(&self) -> Option<OrderBookState> {
-        self.order_book_state.clone()
+    pub(crate) fn is_ready(&self) -> bool {
+        self.status.state == Health::Ready
     }
-
-    pub(crate) const fn is_ready(&self) -> bool {
-        self.order_book_state.is_some()
+    pub(crate) fn accepts(&self, coin: &str) -> bool {
+        self.config.includes(coin)
     }
-
     pub(crate) fn universe(&self) -> HashSet<Coin> {
-        self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe)
+        self.state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe)
     }
-
-    #[allow(clippy::type_complexity)]
-    // pops earliest pair of cached updates that have the same timestamp if possible
-    fn pop_cache(&mut self) -> Option<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
-        // synchronize to same block
-        while let Some(t) = self.order_diff_cache.front() {
-            if let Some(s) = self.order_status_cache.front() {
-                match t.block_number().cmp(&s.block_number()) {
-                    Ordering::Less => {
-                        self.order_diff_cache.pop_front();
-                    }
-                    Ordering::Equal => {
-                        return self
-                            .order_status_cache
-                            .pop_front()
-                            .and_then(|t| self.order_diff_cache.pop_front().map(|s| (t, s)));
-                    }
-                    Ordering::Greater => {
-                        self.order_status_cache.pop_front();
-                    }
+    fn send(&self, message: InternalMessage) {
+        let _unused = self.internal_message_tx.send(Arc::new(message));
+    }
+    fn status_message(&self) {
+        self.send(InternalMessage::Status(self.status.clone()));
+    }
+    fn recover(&mut self, reason: impl ToString, stale: bool) {
+        let reason = reason.to_string();
+        let repeated = self.state.is_none() && self.status.reason == reason;
+        if !repeated {
+            warn!("book recovery height={:?} reason={reason}", self.status.height);
+        }
+        self.status.generation += 1;
+        self.status.resyncs += 1;
+        self.status.state = if stale { Health::Stale } else { Health::Resyncing };
+        self.status.reason = reason;
+        self.state = None;
+        self.checkpoint = None;
+        self.orders.clear();
+        self.diffs.clear();
+        self.fills = None;
+        self.order_watermark = None;
+        self.diff_watermark = None;
+        self.buffered_bytes = 0;
+        if !repeated {
+            self.status_message();
+        }
+    }
+    pub(crate) fn compute_snapshot(&self) -> Option<TimedSnapshots> {
+        if self.is_ready() { self.state.as_ref().map(OrderBookState::compute_snapshot) } else { None }
+    }
+    pub(crate) fn current_l2(&mut self) -> Option<(u64, L2Snapshots)> {
+        if self.is_ready() { self.state.as_mut().and_then(|s| s.l2_snapshots(false)) } else { None }
+    }
+    fn selected_snapshot(&self, snapshot: Snapshots<InnerL4Order>) -> Snapshots<InnerL4Order> {
+        Snapshots::new(snapshot.value().into_iter().filter(|(c, _)| self.config.includes(&c.value())).collect())
+    }
+    fn install(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) -> Result<()> {
+        let snapshot = self.selected_snapshot(snapshot);
+        if let Some(mut checkpoint) = self.checkpoint.take() {
+            let validation = (|| -> Result<()> {
+                if checkpoint.height() > height {
+                    return Err("integrity snapshot behind checkpoint".into());
                 }
-            } else {
-                break;
-            }
-        }
-        None
-    }
-
-    fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
-        match updates {
-            EventBatch::Orders(batch) => {
-                self.order_status_cache.push(batch);
-            }
-            EventBatch::BookDiffs(batch) => {
-                self.order_diff_cache.push(batch);
-            }
-            EventBatch::Fills(batch) => {
-                if self.last_fill.is_none_or(|height| height < batch.block_number()) {
-                    // send fill updates if we received a new update
-                    if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let snapshot = Arc::new(InternalMessage::Fills { batch });
-                            let _unused = tx.send(snapshot);
-                        });
+                while checkpoint.height() < height {
+                    let next = checkpoint.height() + 1;
+                    if self.config.stream_with_block_info
+                        && !(self.order_watermark.is_some_and(|h| h > next)
+                            && self.diff_watermark.is_some_and(|h| h > next))
+                    {
+                        return Err("integrity snapshot ahead of complete stream; retry checkpoint later".into());
                     }
+                    let orders = self.orders.get(&next).ok_or("integrity replay missing order block")?.clone();
+                    let diffs = self.diffs.get(&next).ok_or("integrity replay missing diff block")?.clone();
+                    checkpoint.apply_updates(orders, diffs)?;
                 }
-            }
-        }
-        if self.is_ready() {
-            if let Some((order_statuses, order_diffs)) = self.pop_cache() {
-                self.order_book_state
-                    .as_mut()
-                    .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
-                    .transpose()?;
-                if let Some(cache) = &mut self.fetched_snapshot_cache {
-                    cache.push_back((order_statuses.clone(), order_diffs.clone()));
-                }
-                if let Some(tx) = &self.internal_message_tx {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let updates = Arc::new(InternalMessage::L4BookUpdates {
-                            diff_batch: order_diffs,
-                            status_batch: order_statuses,
-                        });
-                        let _unused = tx.send(updates);
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn begin_caching(&mut self) {
-        self.fetched_snapshot_cache = Some(VecDeque::new());
-    }
-
-    // tkae the cached updates and stop collecting updates
-    fn take_cache(&mut self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
-        self.fetched_snapshot_cache.take().unwrap_or_default()
-    }
-
-    fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
-        info!("No existing snapshot");
-        let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
-        let mut retry = false;
-        while let Some((order_statuses, order_diffs)) = self.pop_cache() {
-            if new_order_book.apply_updates(order_statuses, order_diffs).is_err() {
-                info!(
-                    "Failed to apply updates to this book (likely missing older updates). Waiting for next snapshot."
-                );
-                retry = true;
-                break;
-            }
-        }
-        if !retry {
-            self.order_book_state = Some(new_order_book);
-            info!("Order book ready");
-        }
-    }
-
-    // forcibly grab current snapshot
-    pub(crate) fn compute_snapshot(&mut self) -> Option<TimedSnapshots> {
-        self.order_book_state.as_mut().map(|o| o.compute_snapshot())
-    }
-
-    // prevent snapshotting mutiple times at the same height
-    fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
-        self.order_book_state.as_mut().and_then(|o| o.l2_snapshots(prevent_future_snaps))
-    }
-}
-
-impl OrderBookListener {
-    fn process_update(&mut self, event: &Event, new_path: &PathBuf, event_source: EventSource) -> Result<()> {
-        if event.kind.is_create() {
-            info!("-- Event: {} created --", new_path.display());
-            self.on_file_creation(new_path.clone(), event_source)?;
-        }
-        // Check for `Modify` event (only if the file is already initialized)
-        else {
-            // If we are not tracking anything right now, we treat a file update as declaring that it has been created.
-            // Unfortunately, we miss the update that occurs at this time step.
-            // We go to the end of the file to read for updates after that.
-            if self.is_reading(event_source) {
-                self.on_file_modification(event_source)?;
-            } else {
-                info!("-- Event: {} modified, tracking it now --", new_path.display());
-                let file = self.file_mut(event_source);
-                let mut new_file = File::open(new_path)?;
-                new_file.seek(SeekFrom::End(0))?;
-                *file = Some(new_file);
-            }
-        }
-        Ok(())
-    }
-}
-
-impl DirectoryListener for OrderBookListener {
-    fn is_reading(&self, event_source: EventSource) -> bool {
-        match event_source {
-            EventSource::Fills => self.fill_status_file.is_some(),
-            EventSource::OrderStatuses => self.order_status_file.is_some(),
-            EventSource::OrderDiffs => self.order_diff_file.is_some(),
-        }
-    }
-
-    fn file_mut(&mut self, event_source: EventSource) -> &mut Option<File> {
-        match event_source {
-            EventSource::Fills => &mut self.fill_status_file,
-            EventSource::OrderStatuses => &mut self.order_status_file,
-            EventSource::OrderDiffs => &mut self.order_diff_file,
-        }
-    }
-
-    fn on_file_creation(&mut self, new_file: PathBuf, event_source: EventSource) -> Result<()> {
-        if let Some(file) = self.file_mut(event_source).as_mut() {
-            let mut buf = String::new();
-            file.read_to_string(&mut buf)?;
-            if !buf.is_empty() {
-                self.process_data(buf, event_source)?;
-            }
-        }
-        *self.file_mut(event_source) = Some(File::open(new_file)?);
-        Ok(())
-    }
-
-    fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
-        let total_len = data.len();
-        let lines = data.lines();
-        for line in lines {
-            if line.is_empty() {
-                continue;
-            }
-            let res = match event_source {
-                EventSource::Fills => serde_json::from_str::<Batch<NodeDataFill>>(line).map(|batch| {
-                    let height = batch.block_number();
-                    (height, EventBatch::Fills(batch))
-                }),
-                EventSource::OrderStatuses => serde_json::from_str(line)
-                    .map(|batch: Batch<NodeDataOrderStatus>| (batch.block_number(), EventBatch::Orders(batch))),
-                EventSource::OrderDiffs => serde_json::from_str(line)
-                    .map(|batch: Batch<NodeDataOrderDiff>| (batch.block_number(), EventBatch::BookDiffs(batch))),
-            };
-            let (height, event_batch) = match res {
-                Ok(data) => data,
+                validate_snapshot_consistency(&checkpoint.compute_snapshot().snapshot, snapshot.clone(), true)
+            })();
+            match validation {
+                Ok(()) => info!("integrity comparison passed height={height}"),
                 Err(err) => {
-                    // if we run into a serialization error (hitting EOF), just return to last line.
-                    error!(
-                        "{event_source} serialization error {err}, height: {:?}, line: {:?}",
-                        self.order_book_state.as_ref().map(OrderBookState::height),
-                        &line[..100],
-                    );
-                    #[allow(clippy::unwrap_used)]
-                    let total_len: i64 = total_len.try_into().unwrap();
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
-                    break;
+                    self.status.validation_failures += 1;
+                    warn!("integrity comparison failed height={height}: {err}; rebuilding from authoritative snapshot");
                 }
-            };
-            if height % 100 == 0 {
-                info!("{event_source} block: {height}");
-            }
-            if let Err(err) = self.receive_batch(event_batch) {
-                self.order_book_state = None;
-                return Err(err);
             }
         }
-        let snapshot = self.l2_snapshots(true);
-        if let Some(snapshot) = snapshot {
-            if let Some(tx) = &self.internal_message_tx {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
-                    let _unused = tx.send(snapshot);
+        // Round-trip validation catches duplicate IDs, crossed snapshots or representation loss.
+        let state = OrderBookState::from_snapshot(snapshot.clone(), height, 0, true, true, self.config.markets.clone());
+        validate_snapshot_consistency(&state.compute_snapshot().snapshot, snapshot, true)?;
+        self.state = Some(state);
+        self.last_progress = Instant::now();
+        self.orders.retain(|h, _| *h > height);
+        self.diffs.retain(|h, _| *h > height);
+        self.status.height = Some(height);
+        // Remain gated until a fresh, complete block after the snapshot has been validated.
+        self.status.state = Health::Resyncing;
+        self.status.reason = "snapshot installed; waiting for contiguous live block".into();
+        self.status_message();
+        self.drain()
+    }
+    fn ingest(&mut self, source: usize, line: &str) -> Result<()> {
+        self.buffered_bytes = self.buffered_bytes.saturating_add(line.len());
+        if self.buffered_bytes > self.config.max_buffer_bytes {
+            // Amortized accounting: never serialize the replay queues on the hot path.
+            self.buffered_bytes =
+                self.orders.values().map(|b| serde_json::to_vec(b).map_or(0, |v| v.len())).sum::<usize>()
+                    + self.diffs.values().map(|b| serde_json::to_vec(b).map_or(0, |v| v.len())).sum::<usize>()
+                    + self.fills.as_ref().map_or(0, |b| serde_json::to_vec(b).map_or(0, |v| v.len()))
+                    + line.len();
+            if self.buffered_bytes > self.config.max_buffer_bytes {
+                return Err("replay buffer limit exceeded".into());
+            }
+        }
+        match source {
+            0 => {
+                let mut batch: Batch<NodeDataOrderStatus> = serde_json::from_str(line)?;
+                batch.events.retain(|e| self.config.includes(&e.order.coin));
+                insert_batch(&mut self.orders, &mut self.order_watermark, batch, self.config.stream_with_block_info)?;
+            }
+            1 => {
+                let mut batch: Batch<NodeDataOrderDiff> = serde_json::from_str(line)?;
+                batch.events.retain(|e| self.config.includes(&e.coin().value()));
+                insert_batch(&mut self.diffs, &mut self.diff_watermark, batch, self.config.stream_with_block_info)?;
+            }
+            _ => {
+                let mut batch: Batch<NodeDataFill> = serde_json::from_str(line)?;
+                batch.events.retain(|e| self.config.includes(&e.1.coin));
+                if self.config.stream_with_block_info {
+                    if let Some(mut previous) = self.fills.take() {
+                        if previous.block_number() == batch.block_number() {
+                            previous.events.extend(batch.events);
+                            self.fills = Some(previous);
+                            return Ok(());
+                        }
+                        if previous.block_number() > batch.block_number() {
+                            return Err("fill height regression".into());
+                        }
+                        self.publish_fills(previous);
+                    }
+                    self.fills = Some(batch);
+                } else {
+                    self.publish_fills(batch);
+                }
+            }
+        }
+        self.drain()
+    }
+    fn publish_fills(&mut self, batch: Batch<NodeDataFill>) {
+        if self.last_fill.is_none_or(|h| h < batch.block_number()) {
+            self.last_fill = Some(batch.block_number());
+            self.send(InternalMessage::Fills { batch });
+        }
+    }
+    fn drain(&mut self) -> Result<()> {
+        while let Some(state) = self.state.as_mut() {
+            let next = state.height() + 1;
+            self.orders.retain(|h, _| *h >= next);
+            self.diffs.retain(|h, _| *h >= next);
+            // A later block proves all fragments at `next` are complete in stream mode.
+            if self.config.stream_with_block_info
+                && !(self.order_watermark.is_some_and(|h| h > next) && self.diff_watermark.is_some_and(|h| h > next))
+            {
+                break;
+            }
+            let (Some((&oh, _)), Some((&dh, _))) = (self.orders.first_key_value(), self.diffs.first_key_value()) else {
+                break;
+            };
+            if oh != next || dh != next {
+                return Err(format!("skipped block: expecting {next}, orders={oh}, diffs={dh}").into());
+            }
+            let orders = self.orders.remove(&next).ok_or("missing orders")?;
+            let diffs = self.diffs.remove(&next).ok_or("missing diffs")?;
+            let time = orders.block_time();
+            state.apply_updates(orders.clone(), diffs.clone())?;
+            self.status.height = Some(next);
+            self.status.upstream_time = Some(time);
+            self.last_progress = Instant::now();
+            let age = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            if age.saturating_sub(time) > self.config.stale_after.as_millis() as u64 {
+                return Err(
+                    format!("upstream event time stale: block={next} age_ms={}", age.saturating_sub(time)).into()
+                );
+            }
+            if self.status.state != Health::Ready {
+                self.status.state = Health::Ready;
+                self.status.reason = "contiguous replay validated".into();
+                info!("resync end generation={} height={next} upstream_time={time}", self.status.generation);
+                self.status_message();
+                self.send(InternalMessage::Reset { generation: self.status.generation });
+            } else {
+                self.send(InternalMessage::L4BookUpdates {
+                    generation: self.status.generation,
+                    diff_batch: diffs,
+                    status_batch: orders,
+                });
+            }
+        }
+        if self.is_ready() && self.l2_subscriptions.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            if let Some((time, l2_snapshots)) = self.state.as_mut().and_then(|s| s.l2_snapshots(true)) {
+                self.send(InternalMessage::Snapshot {
+                    generation: self.status.generation,
+                    height: self.status.height.unwrap_or_default(),
+                    l2_snapshots,
+                    time,
                 });
             }
         }
@@ -449,29 +289,353 @@ impl DirectoryListener for OrderBookListener {
     }
 }
 
-pub(crate) struct L2Snapshots(HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>);
+fn insert_batch<E>(
+    queue: &mut BTreeMap<u64, Batch<E>>,
+    watermark: &mut Option<u64>,
+    batch: Batch<E>,
+    streamed: bool,
+) -> Result<()> {
+    let height = batch.block_number();
+    if watermark.is_some_and(|h| height < h) {
+        return Err("upstream block height regressed".into());
+    }
+    if watermark.is_some_and(|h| height == h) && !streamed {
+        return Err("duplicate batch height".into());
+    }
+    *watermark = Some(height);
+    if let Some(previous) = queue.get_mut(&height) {
+        if previous.block_time != batch.block_time {
+            return Err("inconsistent block timestamps".into());
+        }
+        previous.events.extend(batch.events);
+    } else {
+        queue.insert(height, batch);
+    }
+    Ok(())
+}
 
+pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, config: ServerConfig) -> Result<()> {
+    let names = ["node_order_statuses_by_block", "node_raw_book_diffs_by_block", "node_fills_by_block"];
+    // Both metadata modes use the _by_block envelope. Explicit per-stream directory overrides
+    // are supported by symlinking these directories if a node build uses different names.
+    let mut dirs = names.map(|n| config.data_dir.join(n));
+    for (i, custom) in [&config.order_status_dir, &config.book_diff_dir, &config.fills_dir].into_iter().enumerate() {
+        if let Some(path) = custom {
+            dirs[i] = path.clone();
+        }
+    }
+    let mut tails: [Option<Tail>; 3] = [None, None, None];
+    for (i, dir) in dirs.iter().enumerate() {
+        if let Some(path) = latest_file(dir)? {
+            tails[i] = Some(Tail::open(path, true)?);
+        }
+    }
+    let mut ticker = tokio::time::interval(config.poll_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut discovery = Instant::now();
+    let mut next_attempt = Instant::now();
+    let mut last_integrity = Instant::now();
+    let mut snapshot_task = None;
+    let mut snapshot_generation = 0;
+    let mut diagnostic = Instant::now();
+    loop {
+        ticker.tick().await;
+        for i in 0..3 {
+            let result: Result<()> = (|| {
+                if discovery.elapsed() >= Duration::from_secs(1) || tails[i].is_none() {
+                    if let Some(path) = latest_file(&dirs[i])? {
+                        if tails[i].as_ref().is_none_or(|t| t.path() != path) {
+                            if let Some(tail) = &mut tails[i] {
+                                if !tail.drained()? {
+                                    return Ok(());
+                                }
+                                if tail.has_fragment() {
+                                    return Err("partial record at file rotation".into());
+                                }
+                            }
+                            tails[i] = Some(Tail::open(path, false)?);
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(err) = result {
+                listener.lock().await.recover(err, false);
+                tails[i] = None;
+            }
+            if let Some(tail) = &mut tails[i] {
+                match tail.read(config.max_buffer_bytes) {
+                    Ok(lines) => {
+                        let mut book = listener.lock().await;
+                        for line in lines {
+                            if let Err(err) = book.ingest(i, &line) {
+                                if i == 2 {
+                                    warn!("skipping malformed fill batch: {err}");
+                                    book.fills = None;
+                                } else {
+                                    book.status.validation_failures += 1;
+                                    book.recover(err, false);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        listener.lock().await.recover(err, false);
+                    }
+                }
+            }
+        }
+        if discovery.elapsed() >= Duration::from_secs(1) {
+            discovery = Instant::now();
+        }
+        if let Some(task) = snapshot_task.as_mut() {
+            let task: &mut tokio::task::JoinHandle<Result<(u64, Snapshots<InnerL4Order>)>> = task;
+            if task.is_finished() {
+                let result = task.await;
+                snapshot_task = None;
+                let mut book = listener.lock().await;
+                if book.status.generation == snapshot_generation {
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(err) => Err(err.into()),
+                    };
+                    match result.and_then(|(height, snapshot)| book.install(snapshot, height)) {
+                        Ok(()) => {}
+                        Err(err) => {
+                            book.status.validation_failures += 1;
+                            book.recover(err, false);
+                        }
+                    }
+                }
+                next_attempt = Instant::now() + config.retry_interval;
+            }
+        }
+        let mut book = listener.lock().await;
+        if book.state.is_some() && book.last_progress.elapsed() > config.stale_after {
+            book.recover("stream has fallen behind (no complete book blocks)", true);
+        }
+        if !config.integrity_interval.is_zero()
+            && last_integrity.elapsed() >= config.integrity_interval
+            && book.is_ready()
+        {
+            // A scheduled checkpoint is a gated rebuild, never an unchecked replacement.
+            let checkpoint = book.state.take();
+            book.recover("scheduled integrity checkpoint", false);
+            book.checkpoint = checkpoint;
+            next_attempt = Instant::now();
+            last_integrity = Instant::now();
+        }
+        if snapshot_task.is_none() && book.state.is_none() && Instant::now() >= next_attempt {
+            snapshot_generation = book.status.generation;
+            book.status.state = Health::Resyncing;
+            book.status_message();
+            info!("resync start generation={} reason={}", snapshot_generation, book.status.reason);
+            let config = config.clone();
+            snapshot_task = Some(tokio::spawn(async move {
+                let path = process_rmp_file(&config).await?;
+                let parse_start = Instant::now();
+                let read_path = path.clone();
+                let parsed = tokio::task::spawn_blocking(move || {
+                    let json = fs::read_to_string(read_path)?;
+                    load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json)
+                })
+                .await?;
+                if let Err(err) = tokio::fs::remove_file(&path).await {
+                    warn!("snapshot cleanup failed path={} error={err}", path.display());
+                }
+                info!("snapshot_parse_ms={}", parse_start.elapsed().as_millis());
+                parsed
+            }));
+        }
+        if diagnostic.elapsed() >= Duration::from_secs(30) {
+            info!(
+                "feed state={:?} height={:?} upstream_time={:?} clients={} replay_bytes={}",
+                book.status.state,
+                book.status.height,
+                book.status.upstream_time,
+                book.internal_message_tx.receiver_count(),
+                book.buffered_bytes
+            );
+            diagnostic = Instant::now();
+        }
+    }
+}
+
+pub(crate) struct L2Snapshots(HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>);
 impl L2Snapshots {
     pub(crate) const fn as_ref(&self) -> &HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>> {
         &self.0
     }
 }
-
 pub(crate) struct TimedSnapshots {
     pub(crate) time: u64,
     pub(crate) height: u64,
     pub(crate) snapshot: Snapshots<InnerL4Order>,
 }
-
-// Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
-    Snapshot { l2_snapshots: L2Snapshots, time: u64 },
+    Status(FeedStatus),
+    Reset { generation: u64 },
+    Snapshot { generation: u64, height: u64, l2_snapshots: L2Snapshots, time: u64 },
     Fills { batch: Batch<NodeDataFill> },
-    L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
+    L4BookUpdates { generation: u64, diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
 }
-
 #[derive(Eq, PartialEq, Hash)]
 pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+    fn listener(stream: bool) -> OrderBookListener {
+        let (tx, _) = tokio::sync::broadcast::channel(100);
+        let config = ServerConfig { stream_with_block_info: stream, ..ServerConfig::default() };
+        OrderBookListener::new(tx, config)
+    }
+    fn snapshot() -> Snapshots<InnerL4Order> {
+        Snapshots::new(HashMap::from([(Coin::new("BTC"), Snapshot::new([vec![], vec![]]))]))
+    }
+    fn batch(height: u64, events: Vec<Value>) -> String {
+        static TIME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let time = TIME.get_or_init(|| chrono::Utc::now().naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string());
+        json!({"local_time":time,"block_time":time,"block_number":height,"events":events}).to_string()
+    }
+    fn status(oid: u64, px: &str) -> Value {
+        json!({"time":"2026-01-01T00:00:00","user":"0x0000000000000000000000000000000000000001",
+            "status":"open","order":{"coin":"BTC","side":"B","limitPx":px,"sz":"1","oid":oid,
+            "timestamp":1,"triggerCondition":"N/A","isTrigger":false,"triggerPx":"0",
+            "isPositionTpsl":false,"reduceOnly":false,"orderType":"Limit","tif":"Gtc","cloid":null}})
+    }
+    fn diff(oid: u64, px: &str, change: Value) -> Value {
+        json!({"user":"0x0000000000000000000000000000000000000001","oid":oid,"coin":"BTC","px":px,"raw_book_diff":change})
+    }
+    fn empty_block(book: &mut OrderBookListener, h: u64) -> Result<()> {
+        let line = batch(h, vec![]);
+        book.ingest(0, &line)?;
+        book.ingest(1, &line)
+    }
+    #[test]
+    fn missed_block_gates_then_recovers_without_replacing_channel() {
+        let mut book = listener(false);
+        let mut rx = book.internal_message_tx.subscribe();
+        book.install(snapshot(), 100).unwrap();
+        assert!(!book.is_ready());
+        empty_block(&mut book, 101).unwrap();
+        assert!(book.is_ready());
+        let err = empty_block(&mut book, 103).unwrap_err();
+        book.recover(err, false);
+        assert!(!book.is_ready());
+        assert!(book.compute_snapshot().is_none());
+        book.install(snapshot(), 103).unwrap();
+        empty_block(&mut book, 104).unwrap();
+        assert!(book.is_ready());
+        assert_eq!(book.status.height, Some(104));
+        let mut reset = 0;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(*msg, InternalMessage::Reset { .. }) {
+                reset += 1;
+            }
+        }
+        assert_eq!(reset, 2);
+    }
+    #[test]
+    fn stream_fragments_wait_for_both_watermarks() {
+        let mut book = listener(true);
+        book.install(snapshot(), 100).unwrap();
+        book.ingest(0, &batch(101, vec![status(1, "100")])).unwrap();
+        book.ingest(1, &batch(101, vec![diff(1, "100", json!({"new":{"sz":"1"}}))])).unwrap();
+        book.ingest(0, &batch(101, vec![status(2, "99")])).unwrap();
+        book.ingest(1, &batch(101, vec![diff(2, "99", json!({"new":{"sz":"1"}}))])).unwrap();
+        assert!(!book.is_ready());
+        book.ingest(0, &batch(102, vec![])).unwrap();
+        assert!(!book.is_ready());
+        book.ingest(1, &batch(102, vec![])).unwrap();
+        assert!(book.is_ready());
+        let snap = book.compute_snapshot().unwrap();
+        assert_eq!(snap.height, 101);
+        assert_eq!(snap.snapshot.as_ref()[&Coin::new("BTC")].as_ref()[0].len(), 2);
+    }
+    #[test]
+    fn duplicate_batch_and_regression_rejected() {
+        let mut book = listener(false);
+        book.ingest(0, &batch(10, vec![])).unwrap();
+        assert!(book.ingest(0, &batch(10, vec![])).is_err());
+        assert!(book.ingest(0, &batch(9, vec![])).is_err());
+    }
+    #[test]
+    fn price_divergence_and_original_size_detected() {
+        for (px, size) in [("101", "1"), ("100", "2")] {
+            let mut book = listener(false);
+            book.install(snapshot(), 100).unwrap();
+            book.ingest(0, &batch(101, vec![status(1, "100")])).unwrap();
+            book.ingest(1, &batch(101, vec![diff(1, "100", json!({"new":{"sz":"1"}}))])).unwrap();
+            book.ingest(0, &batch(102, vec![])).unwrap();
+            assert!(
+                book.ingest(1, &batch(102, vec![diff(1, px, json!({"update":{"origSz":size,"newSz":"0.5"}}))]))
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn new_order_price_mismatch_rejected() {
+        let mut book = listener(false);
+        book.install(snapshot(), 100).unwrap();
+        book.ingest(0, &batch(101, vec![status(1, "100")])).unwrap();
+        assert!(book.ingest(1, &batch(101, vec![diff(1, "100.00000001", json!({"new":{"sz":"1"}}))])).is_err());
+    }
+    #[test]
+    fn market_filter_ignores_unselected_orders_but_preserves_heights() {
+        let mut book = listener(false);
+        book.config.markets.insert("HYPE".into());
+        book.install(snapshot(), 100).unwrap();
+        book.ingest(0, &batch(101, vec![status(1, "100")])).unwrap();
+        book.ingest(1, &batch(101, vec![diff(1, "100", json!({"new":{"sz":"1"}}))])).unwrap();
+        assert!(book.is_ready());
+        assert!(book.universe().is_empty());
+    }
+    #[test]
+    fn bounded_cache_and_malformed_input() {
+        let mut book = listener(false);
+        book.config.max_buffer_bytes = 32;
+        assert!(book.ingest(0, &batch(1, vec![])).is_err());
+        assert!(book.ingest(1, "{").is_err());
+    }
+    #[test]
+    fn stale_event_timestamp_not_published() {
+        let mut book = listener(false);
+        book.install(snapshot(), 100).unwrap();
+        let mut line: Value = serde_json::from_str(&batch(101, vec![])).unwrap();
+        line["block_time"] = json!("2020-01-01T00:00:00");
+        book.ingest(0, &line.to_string()).unwrap();
+        let err = book.ingest(1, &line.to_string()).unwrap_err();
+        book.recover(err, true);
+        assert_eq!(book.status.state, Health::Stale);
+        assert!(book.current_l2().is_none());
+    }
+    #[test]
+    fn replay_ignores_blocks_at_or_before_snapshot() {
+        let mut book = listener(false);
+        empty_block(&mut book, 99).unwrap();
+        empty_block(&mut book, 100).unwrap();
+        empty_block(&mut book, 101).unwrap();
+        book.install(snapshot(), 100).unwrap();
+        assert_eq!(book.status.height, Some(101));
+        assert!(book.is_ready());
+    }
+    #[test]
+    fn integrity_mismatch_rebuilds_and_counts_failure() {
+        let mut book = listener(false);
+        book.install(snapshot(), 100).unwrap();
+        book.ingest(0, &batch(101, vec![status(1, "100")])).unwrap();
+        book.ingest(1, &batch(101, vec![diff(1, "100", json!({"new":{"sz":"1"}}))])).unwrap();
+        book.checkpoint = book.state.take();
+        book.install(snapshot(), 101).unwrap();
+        assert_eq!(book.status.validation_failures, 1);
+        assert!(!book.is_ready());
+        empty_block(&mut book, 102).unwrap();
+        assert!(book.is_ready());
+    }
 }

@@ -6,41 +6,33 @@ use crate::{
         types::InnerOrder,
     },
     prelude::*,
-    types::{
-        inner::InnerLevel,
-        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
-    },
+    types::inner::InnerLevel,
 };
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use reqwest::Client;
 use serde_json::json;
-use std::collections::VecDeque;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, path::PathBuf};
 
-pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
-    let output_path = dir.join("out.json");
+pub(super) async fn process_rmp_file(config: &crate::ServerConfig) -> Result<PathBuf> {
+    // Unique names prevent a timed-out request from racing with a subsequent attempt.
+    let id = format!("{}.{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default());
+    let output_path = config.snapshot_path.with_extension(format!("{id}.json"));
+    let node_path = config.snapshot_node_path.with_extension(format!("{id}.json"));
     let payload = json!({
         "type": "fileSnapshot",
-        "request": {
-            "type": "l4Snapshots",
-            "includeUsers": true,
-            "includeTriggerOrders": false
-        },
-        "outPath": output_path,
-        "includeHeightInOutput": true
+        "request": { "type": "l4Snapshots", "includeUsers": true, "includeTriggerOrders": false },
+        "outPath": node_path, "includeHeightInOutput": true
     });
-
-    let client = Client::new();
-    client
-        .post("http://localhost:3001/info")
-        .header("Content-Type", "application/json")
+    let start = std::time::Instant::now();
+    Client::builder()
+        .timeout(config.snapshot_timeout)
+        .build()?
+        .post(&config.info_url)
         .json(&payload)
         .send()
         .await?
         .error_for_status()?;
+    log::info!("snapshot_generation_ms={}", start.elapsed().as_millis());
     Ok(output_path)
 }
 
@@ -59,6 +51,9 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
         let book1 = book.as_ref();
         if let Some(book2) = snapshot_map.remove(coin) {
             for (orders1, orders2) in book1.as_ref().iter().zip(book2.as_ref()) {
+                if orders1.len() != orders2.len() {
+                    return Err(format!("Order count mismatch for {}", coin.value()).into());
+                }
                 for (order1, order2) in orders1.iter().zip(orders2.iter()) {
                     if *order1 != *order2 {
                         return Err(
@@ -118,38 +113,22 @@ pub(super) fn compute_l2_snapshots<O: InnerOrder + Send + Sync>(order_books: &Or
     )
 }
 
-pub(super) enum EventBatch {
-    Orders(Batch<NodeDataOrderStatus>),
-    BookDiffs(Batch<NodeDataOrderDiff>),
-    Fills(Batch<NodeDataFill>),
-}
-
-pub(super) struct BatchQueue<T> {
-    deque: VecDeque<Batch<T>>,
-    last_ts: Option<u64>,
-}
-
-impl<T> BatchQueue<T> {
-    pub(super) const fn new() -> Self {
-        Self { deque: VecDeque::new(), last_ts: None }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::order_book::Coin;
+    fn snapshot(orders: Vec<u64>) -> Snapshots<u64> {
+        Snapshots::new(HashMap::from([(Coin::new("BTC"), Snapshot::new([orders, vec![]]))]))
     }
-
-    pub(super) fn push(&mut self, block: Batch<T>) -> bool {
-        if let Some(last_ts) = self.last_ts {
-            if last_ts >= block.block_number() {
-                return false;
-            }
-        }
-        self.last_ts = Some(block.block_number());
-        self.deque.push_back(block);
-        true
+    #[test]
+    fn detects_extra_orders_even_when_prefix_matches() {
+        assert!(validate_snapshot_consistency(&snapshot(vec![1]), snapshot(vec![1, 2]), false).is_err());
+        assert!(validate_snapshot_consistency(&snapshot(vec![1, 2]), snapshot(vec![1]), false).is_err());
     }
-
-    pub(super) fn pop_front(&mut self) -> Option<Batch<T>> {
-        self.deque.pop_front()
-    }
-
-    pub(super) fn front(&self) -> Option<&Batch<T>> {
-        self.deque.front()
+    #[test]
+    fn detects_order_value_and_market_changes() {
+        assert!(validate_snapshot_consistency(&snapshot(vec![1]), snapshot(vec![2]), false).is_err());
+        let other = Snapshots::new(HashMap::from([(Coin::new("HYPE"), Snapshot::new([vec![1], vec![]]))]));
+        assert!(validate_snapshot_consistency(&snapshot(vec![1]), other, false).is_err());
     }
 }
