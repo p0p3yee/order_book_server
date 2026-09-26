@@ -211,10 +211,12 @@ async fn handle_socket_inner(
                                 send_socket_message(&mut socket, ServerResponse::Status(status.clone())).await;
                             },
                             InternalMessage::Reset { generation } => {
+                                if !manager.has_book() { continue; }
                                 if listener.lock().await.status.generation != *generation { continue; }
                                 refresh_books(&mut socket, &manager, &listener, &mut book_heights).await;
                             },
                             InternalMessage::Snapshot{ generation, height, l2_snapshots, time, .. } => {
+                                if !manager.has_l2_book() { continue; }
                                 { let book = listener.lock().await;
                                   if !book.is_ready() || book.status.generation != *generation { continue; } }
 
@@ -235,9 +237,9 @@ async fn handle_socket_inner(
                                 }
                             },
                             InternalMessage::L4BookUpdates{ generation, diff_batch, status_batch, .. } => {
+                                if !manager.has_l4_book() { continue; }
                                 { let book = listener.lock().await;
                                   if !book.is_ready() || book.status.generation != *generation { continue; } }
-                                if !manager.subscriptions().iter().any(|s| matches!(s, Subscription::L4Book { .. })) { continue; }
 
                                 let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
                                 for sub in manager.subscriptions() {
@@ -255,7 +257,9 @@ async fn handle_socket_inner(
                         internal_message_rx = internal_message_tx.subscribe();
                         send_socket_message(&mut socket, ServerResponse::Error(format!("Client fell behind by {n} messages; book snapshots reset; trades may have gaps"))).await;
                         send_current_status(&mut socket, &listener).await;
-                        refresh_books(&mut socket, &manager, &listener, &mut book_heights).await;
+                        if manager.has_book() {
+                            refresh_books(&mut socket, &manager, &listener, &mut book_heights).await;
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }

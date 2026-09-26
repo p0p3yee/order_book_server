@@ -695,9 +695,22 @@ fn run_worker(
                     if line.trim().is_empty() {
                         continue;
                     }
+                    let read_us = chrono::Utc::now().timestamp_micros();
                     let start = Instant::now();
                     let decoded = decode(i, &line, &allowed);
                     metrics.elapsed("decode_us", start);
+                    if let Ok(batch) = &decoded {
+                        if let Some(node_local_us) = batch.node_local_us {
+                            metrics.observe(
+                                ["wallet_orders_block_to_node_local_us", "wallet_fills_block_to_node_local_us"][i],
+                                node_local_us.saturating_sub(batch.block_us) as f64,
+                            );
+                            metrics.observe(
+                                ["wallet_orders_node_local_to_read_us", "wallet_fills_node_local_to_read_us"][i],
+                                read_us.saturating_sub(node_local_us) as f64,
+                            );
+                        }
+                    }
                     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                     let previous_height = s.sources[i].height;
                     // Historical records are valid replay inputs. Readiness is decided only after
@@ -855,11 +868,15 @@ fn save(path: &PathBuf, journal: &Journal) -> crate::Result<()> {
 struct RawBatch<E> {
     block_number: u64,
     block_time: chrono::NaiveDateTime,
+    #[serde(default)]
+    local_time: Option<chrono::NaiveDateTime>,
     events: Vec<E>,
 }
 struct Decoded {
     height: u64,
     time: i64,
+    block_us: i64,
+    node_local_us: Option<i64>,
     events: Vec<(String, &'static str, Value, String)>,
 }
 fn selected_user(user: &str, allowed: &HashSet<String>) -> Option<String> {
@@ -876,7 +893,7 @@ fn selected_user(user: &str, allowed: &HashSet<String>) -> Option<String> {
 }
 fn decode(source: usize, line: &str, allowed: &HashSet<String>) -> Result<Decoded, String> {
     let mut selected = Vec::new();
-    let (height, time) = if source == 1 {
+    let (height, block_time, local_time) = if source == 1 {
         let batch: RawBatch<(&str, &RawValue)> =
             serde_json::from_str(line).map_err(|e| format!("malformed fill batch: {e}"))?;
         for (user, payload) in batch.events {
@@ -887,7 +904,7 @@ fn decode(source: usize, line: &str, allowed: &HashSet<String>) -> Result<Decode
             let value: Value = serde_json::from_str(payload.get()).map_err(|_| "invalid fill event")?;
             selected.push((user, value));
         }
-        (batch.block_number, batch.block_time.and_utc().timestamp_millis())
+        (batch.block_number, batch.block_time, batch.local_time)
     } else {
         #[derive(Deserialize)]
         struct Envelope<'a> {
@@ -907,8 +924,11 @@ fn decode(source: usize, line: &str, allowed: &HashSet<String>) -> Result<Decode
             let order: Value = serde_json::from_str(e.order.get()).map_err(|_| "invalid order event")?;
             selected.push((user, json!({"order":order,"status":e.status,"time":e.time})));
         }
-        (batch.block_number, batch.block_time.and_utc().timestamp_millis())
+        (batch.block_number, batch.block_time, batch.local_time)
     };
+    let block_us = block_time.and_utc().timestamp_micros();
+    let time = block_time.and_utc().timestamp_millis();
+    let node_local_us = local_time.map(|time| time.and_utc().timestamp_micros());
     let mut events = Vec::new();
     for (user, value) in selected {
         let (channel, data, key) = if source == 1 {
@@ -954,7 +974,7 @@ fn decode(source: usize, line: &str, allowed: &HashSet<String>) -> Result<Decode
         };
         events.push((user, channel, data, key));
     }
-    Ok(Decoded { height, time, events })
+    Ok(Decoded { height, time, block_us, node_local_us, events })
 }
 fn apply(s: &mut State, source: usize, batch: Decoded, streamed: bool, stale: Duration) -> Result<bool, String> {
     let previous = &s.sources[source];
@@ -1112,6 +1132,27 @@ mod tests {
         let mut bad = event;
         bad["order"].as_object_mut().unwrap().remove("origSz");
         assert!(decode(0, &batch(1, json!([bad])), &allowed).is_err());
+    }
+    #[test]
+    fn wallet_decode_preserves_node_timing_and_accepts_legacy_batches() {
+        let allowed = HashSet::from([USER.into()]);
+        let timed = json!({
+            "local_time":"2026-09-25T04:00:00.123456",
+            "block_time":"2026-09-25T04:00:00.120000",
+            "block_number":1,
+            "events":[]
+        })
+        .to_string();
+        let decoded = decode(0, &timed, &allowed).unwrap();
+        assert_eq!(decoded.node_local_us.unwrap() - decoded.block_us, 3_456);
+
+        let legacy = json!({
+            "block_time":"2026-09-25T04:00:00.120000",
+            "block_number":2,
+            "events":[]
+        })
+        .to_string();
+        assert_eq!(decode(0, &legacy, &allowed).unwrap().node_local_us, None);
     }
     #[test]
     fn historical_gaps_do_not_label_normal_initialization_as_gap_recovery() {

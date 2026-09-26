@@ -276,6 +276,8 @@ query rates. Stale/error queries are retried with the configured minimum interva
 
 `/diagnostics.wallet` reports source heights/times, coverage start, replay state,
 gaps, journal errors, hot-cache size and decode/persist/open-order/account sample timings.
+When the node records `local_time`, it also reports separate block-to-node-local and
+node-local-to-reader timings for wallet orders and fills.
 Raw wallet history is not exposed by diagnostics. Existing market-data diagnostics
 remain available for before/after comparisons.
 
@@ -337,9 +339,18 @@ same full commit you intend to build, then run:
 WS_WALLETS=0xYOUR_TRADING_WALLET bash scripts/deploy_local_wallets.sh FULL_COMMIT_SHA
 ```
 
+The script defaults to the existing batched node output. If `hyperliquid-node` is
+started with `--stream-with-block-info` instead of `--batch-by-block`, pass the
+matching mode to the WS replacement:
+
+```sh
+HL_NODE_OUTPUT_MODE=stream WS_WALLETS=0xYOUR_TRADING_WALLET \
+  bash scripts/deploy_local_wallets.sh FULL_COMMIT_SHA
+```
+
 It builds first, stops/removes only `hyperliquid-ws-low-latency`, and starts the
 replacement with the existing market/snapshot/network settings. It does not change
-`hyperliquid-node`. Replacement disconnects current clients and starts a normal
+`hyperliquid-node`; the producer and reader modes must match. Replacement disconnects current clients and starts a normal
 startup snapshot. This script has been syntax-checked locally, not run against the
 production host. It does not automatically roll back a runtime startup failure;
 previous image tags remain available. There is no automatic container replacement

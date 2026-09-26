@@ -139,6 +139,25 @@ impl OrderBookListener {
             self.status_message();
         }
     }
+    /// Gate publication during a freshness-only pause without discarding a
+    /// validated reconstruction. A later contiguous block can resume from the
+    /// existing height; actual parse, continuity and integrity errors still use
+    /// `recover` and rebuild from an authoritative snapshot.
+    fn pause_stale(&mut self, reason: impl ToString) {
+        if self.state.is_none() {
+            return;
+        }
+        if self.status.state == Health::Ready {
+            // Invalidate publications already queued for the previous Ready
+            // period exactly once. Repeated watchdog checks must be idempotent.
+            self.status.generation += 1;
+        }
+        if self.status.state != Health::Stale {
+            self.status.state = Health::Stale;
+            self.status.reason = reason.to_string();
+            self.status_message();
+        }
+    }
     pub(crate) fn compute_snapshot(&self) -> Option<TimedSnapshots> {
         let _phase = self.lock_diagnostics.as_ref().map(|d| d.phase("l4Snapshot"));
         if self.is_ready() { self.state.as_ref().map(OrderBookState::compute_snapshot) } else { None }
@@ -367,15 +386,10 @@ impl OrderBookListener {
                 // Age is not a reconstruction mismatch. Preserve validated contiguous
                 // replay while gating all book delivery until a fresh block is applied.
                 // Invalidate queued publications from the previous Ready period.
-                if self.status.state == Health::Ready {
-                    self.status.generation += 1;
-                }
-                if self.status.state != Health::Stale {
-                    self.status.state = Health::Stale;
-                    self.status.reason =
-                        format!("contiguous replay catching up: block={next} age_ms={}", age.saturating_sub(time));
-                    self.status_message();
-                }
+                self.pause_stale(format!(
+                    "contiguous replay catching up: block={next} age_ms={}",
+                    age.saturating_sub(time)
+                ));
                 continue;
             }
             if self.status.state != Health::Ready {
@@ -587,7 +601,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, config: S
         }
         let mut book = listener.lock().await;
         if book.state.is_some() && book.last_progress.elapsed() > config.stale_after {
-            book.recover("stream has fallen behind (no complete book blocks)", true);
+            book.pause_stale("stream paused (no complete book blocks)");
         }
         if !config.integrity_interval.is_zero()
             && last_integrity.elapsed() >= config.integrity_interval
@@ -873,6 +887,43 @@ mod tests {
         assert_eq!(book.status.height, Some(110));
         assert_eq!(book.status.resyncs, 0);
         assert!(empty_block(&mut book, 112).is_err()); // Real gaps still require recovery.
+    }
+    #[test]
+    fn no_progress_watchdog_preserves_state_and_buffered_fragments() {
+        let mut book = listener(true);
+        book.install(snapshot(), 100).unwrap();
+        // Block 101 becomes complete when both streams advance to 102. Block
+        // 102 remains buffered as the completion watermark for streamed mode.
+        book.ingest(0, &batch(101, vec![])).unwrap();
+        book.ingest(1, &batch(101, vec![])).unwrap();
+        book.ingest(0, &batch(102, vec![])).unwrap();
+        book.ingest(1, &batch(102, vec![])).unwrap();
+        assert!(book.is_ready());
+        assert_eq!(book.status.height, Some(101));
+        assert!(book.orders.contains_key(&102));
+        assert!(book.diffs.contains_key(&102));
+
+        let generation = book.status.generation;
+        book.pause_stale("stream paused (no complete book blocks)");
+        assert_eq!(book.status.state, Health::Stale);
+        assert_eq!(book.status.generation, generation + 1);
+        assert_eq!(book.status.resyncs, 0);
+        assert_eq!(book.status.validation_failures, 0);
+        assert!(book.state.is_some());
+        assert!(book.orders.contains_key(&102));
+        assert!(book.diffs.contains_key(&102));
+
+        // Repeated watchdog ticks do not repeatedly invalidate the generation.
+        book.pause_stale("stream paused (no complete book blocks)");
+        assert_eq!(book.status.generation, generation + 1);
+
+        // The next watermark completes block 102 and resumes without a snapshot.
+        book.ingest(0, &batch(103, vec![])).unwrap();
+        book.ingest(1, &batch(103, vec![])).unwrap();
+        assert!(book.is_ready());
+        assert_eq!(book.status.height, Some(102));
+        assert_eq!(book.status.resyncs, 0);
+        assert_eq!(book.status.validation_failures, 0);
     }
     #[test]
     fn replay_ignores_blocks_at_or_before_snapshot() {

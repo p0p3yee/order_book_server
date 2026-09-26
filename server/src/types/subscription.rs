@@ -99,6 +99,18 @@ impl SubscriptionManager {
     pub(crate) const fn subscriptions(&self) -> &HashSet<Subscription> {
         &self.subscriptions
     }
+
+    pub(crate) fn has_l2_book(&self) -> bool {
+        self.subscriptions.iter().any(|subscription| matches!(subscription, Subscription::L2Book { .. }))
+    }
+
+    pub(crate) fn has_l4_book(&self) -> bool {
+        self.subscriptions.iter().any(|subscription| matches!(subscription, Subscription::L4Book { .. }))
+    }
+
+    pub(crate) fn has_book(&self) -> bool {
+        self.has_l2_book() || self.has_l4_book()
+    }
 }
 
 #[cfg(test)]
@@ -106,6 +118,25 @@ mod test {
     use crate::types::subscription::Subscription;
 
     use super::{ClientMessage, ServerResponse};
+
+    #[test]
+    fn book_interest_excludes_trade_and_wallet_only_connections() {
+        let mut manager = super::SubscriptionManager::default();
+        assert!(!manager.has_book());
+        manager.subscribe(Subscription::Trades { coin: "BTC".into() });
+        assert!(!manager.has_book());
+        manager.subscribe(Subscription::L2Book {
+            coin: "BTC".into(),
+            n_sig_figs: None,
+            n_levels: None,
+            mantissa: None,
+        });
+        assert!(manager.has_l2_book());
+        assert!(manager.has_book());
+        assert!(!manager.has_l4_book());
+        manager.subscribe(Subscription::L4Book { coin: "BTC".into() });
+        assert!(manager.has_l4_book());
+    }
 
     #[test]
     fn test_message_deserialization_subscription_response() {

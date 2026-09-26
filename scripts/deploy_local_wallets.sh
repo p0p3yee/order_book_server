@@ -6,6 +6,11 @@ revision=${1:?Usage: WS_WALLETS=0xADDRESS[,0xADDRESS] bash deploy_local_wallets.
 : "${WS_WALLETS:?Set WS_WALLETS to the comma-separated trading wallet addresses}"
 : "${HL_DATA_DIR:?Set HL_DATA_DIR to the host node output directory}"
 : "${HL_NODE_SNAPSHOT_PATH:?Set HL_NODE_SNAPSHOT_PATH to the snapshot file path inside hl-node}"
+HL_NODE_OUTPUT_MODE=${HL_NODE_OUTPUT_MODE:-batch}
+[[ "$HL_NODE_OUTPUT_MODE" = batch || "$HL_NODE_OUTPUT_MODE" = stream ]] || {
+  echo 'HL_NODE_OUTPUT_MODE must be batch or stream' >&2
+  exit 1
+}
 [[ "$HL_DATA_DIR" = /* && -d "$HL_DATA_DIR" ]] || { echo 'HL_DATA_DIR must be an existing absolute directory' >&2; exit 1; }
 [[ "$HL_NODE_SNAPSHOT_PATH" = /* ]] || { echo 'HL_NODE_SNAPSHOT_PATH must be absolute' >&2; exit 1; }
 IFS=',' read -r -a selected_wallets <<< "$WS_WALLETS"
@@ -20,6 +25,10 @@ curl --fail --show-error --location \
   -o "$build_dir/Dockerfile"
 image="hyperliquid-ws:wallets-${revision:0:7}"
 docker build --build-arg "SOURCE_REVISION=$revision" -t "$image" "$build_dir"
+mode_args=()
+if [[ "$HL_NODE_OUTPUT_MODE" = stream ]]; then
+  mode_args+=(--stream-with-block-info)
+fi
 # Build failure exits above, leaving the running container intact.
 if docker container inspect hyperliquid-ws-low-latency >/dev/null 2>&1; then
   docker stop hyperliquid-ws-low-latency
@@ -43,5 +52,6 @@ docker run -d \
   --snapshot-node-path "$HL_NODE_SNAPSHOT_PATH" \
   --info-url http://127.0.0.1:3001/info \
   --markets BTC,HYPE,AERO,xyz:NVDA,xyz:DRAM \
-  --websocket-compression-level 0 --integrity-interval-secs 0 --poll-interval-ms 5
+  --websocket-compression-level 0 --integrity-interval-secs 0 --poll-interval-ms 5 \
+  "${mode_args[@]}"
 echo 'Replacement started. Check docker logs and /health for Ready before reconnecting the bot.'
